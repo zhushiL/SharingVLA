@@ -1,0 +1,19 @@
+# 多数据集训练清单：每个有效行 = 机器人配置名 数据集目录。
+# 机器人名对应 configs/robot_configs/<name>.yaml；相对路径以仓库根目录为基准。
+# 当前只开启本机已有数据。使用多数据集时，再增加或取消注释至少一个数据集。
+# 不要把同一数据集重复列出当成不同数据集；全局按帧随机采样，数据量越大占比越高。
+own_robot ../data/bi_rebot_09_pick_and_place_1023-annotated
+
+# 以下保留原清单中的数据集名称和历史路径；使用前改为本机路径并取消注释。
+# own_robot 的原生字段布局须与 configs/robot_configs/own_robot.yaml 一致。
+# own_robot /root/localstorage/zhushilin_cache/datasets/test_tube_0729
+# own_robot /root/localstorage/zhushilin_cache/datasets/optical-module-insertion-0731
+# own_robot /root/localstorage/zhushilin_cache/datasets/earbud_case_insertion_teleop_0515
+# own_robot /root/localstorage/zhushilin_cache/datasets/newbalance_shoe_insole_retrieval_and_packing_0611
+# own_robot /root/localstorage/zhushilin_cache/datasets/assemble_box_with_phone_stand0430_merged
+# own_robot /root/localstorage/zhushilin_cache/datasets/dewu_bag_inspection_0611
+# own_robot /root/localstorage/zhushilin_cache/datasets/stack-cubes-flexiv-0801
+# own_robot /root/localstorage/zhushilin_cache/datasets/bottle-sorting-0810
+# own_robot /root/localstorage/zhushilin_cache/datasets/whiteboard_inspect_0708
+# own_robot /root/localstorage/zhushilin_cache/datasets/pick_up_cube_0713
+# own_robot /root/localstorage/zhushilin_cache/datasets/three-plug-insertion-0820

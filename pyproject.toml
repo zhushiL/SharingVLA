@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xense0vla"
+dynamic = ["version", "dependencies"]
+authors = [
+  { name="Robbyant Team"},
+]
+description = "Qwen3.5 MoT VLA and independent wrist/state action policy"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
+[project.urls]
+Homepage = "https://www.robbyant.com"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["xense0vla", "xense0vla.*"]
+namespaces = false
+
+[tool.setuptools.dynamic]
+version = { attr = "xense0vla.__version__" }
+dependencies = { file = ["requirements.txt"] }
+
+[tool.ruff]
+target-version = "py310"
+line-length = 119
+indent-width = 4
+
+[tool.ruff.lint]
+ignore = ["C901", "E501", "E741", "W605", "C408"]
+select = ["C", "E", "F", "I", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401", "F403", "F811"]
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+known-first-party = ["xense0vla"]
+known-third-party = ["torch", "transformers", "wandb"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"

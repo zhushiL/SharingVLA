@@ -1,0 +1,24 @@
+# 多数据集共用归一化统计：先修改 assets/data_path/multi_pretrain_datasets.txt。
+# bash train.sh scripts/compute_norm_stats.py configs/norm_compute/multi_pretrain.yaml
+data:
+  # ---- 数据集清单与机器人映射 ----
+  data_name: multi
+  train_path: assets/data_path/multi_pretrain_datasets.txt
+  robot_config_root: configs/robot_configs
+  # 仅统计下列机器人；新增类型时同步更新。各映射必须输出相同的动作 / 状态空间。
+  robot_name: own_robot
+
+  # ---- 输出与采样 ----
+  norm_path: assets/norm_stats/multi_pretrain.json
+  # 统计使用的样本帧比例：(0,1]；1.0 全量，0.1 随机抽取约 10% 的帧及其完整动作块。
+  data_ratio_for_norm_compute: 1.0
+  # true：相对动作在 chunk 时间维共享统计；false：每个未来步分别统计。state / 绝对动作不受影响。
+  norm_merge_chunk_dim: true
+  num_workers: 8
+
+train:
+  # ---- 动作块长度应与训练一致 ----
+  micro_batch_size: 512
+  chunk_size: 50
+  output_dir: outputs/multi_norm_stats
+  max_steps: 100000000

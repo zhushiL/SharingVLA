@@ -1,0 +1,93 @@
+# 独立 action policy 预训练
+# 启动：bash train.sh tasks/train_action_policy.py configs/policy_action/multi_pretrain.yaml
+# 配置独立维护；更换数据 / 动作组成后需重新计算 configs/norm_compute/ 下的统计。
+
+model:
+  # ---- 初始化权重：路径相对仓库根目录 ----
+  vlm_path: pretrained_models/Qwen3.5-2B
+
+  # ---- 模型结构与注意力后端 ----
+  action_expert_hidden_size: 1024
+  action_expert_intermediate_size: 3072
+  joint_attention_backend: sdpa
+  vit_attn_implementation: sdpa
+
+data:
+  # ---- 数据集与机器人映射 ----
+  data_name: multi
+  train_path: assets/data_path/multi_pretrain_datasets.txt
+  robot_config_root: configs/robot_configs
+  norm_stats_file: assets/norm_stats/multi_pretrain.json
+
+  # ---- 动作 / 状态组成（顺序一致；当前数据只有 TCP 与夹爪，共 20 维） ----
+  joints:
+    # - arm.position: 14
+    - end.position: 18
+    - effector.position: 2
+  norm_type:
+    # - arm.position: bounds_99
+    - end.position: bounds_99
+    - effector.position: minmax
+
+  # ---- 相机顺序：左腕、右腕；不读取头部、任务或子任务 ----
+  cameras:
+    - camera_wrist_left
+    - camera_wrist_right
+  img_size: 256
+
+  # ---- 标准数据加载（图像统一由 Qwen processor 在 CPU 预处理） ----
+  video_backend: torchcodec
+  num_workers: 8
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true
+
+train:
+  # ---- 输入长度与动作去噪 ----
+  action_dim: 20
+  max_action_dim: 20
+  max_state_dim: 20
+  chunk_size: 50
+  num_steps: 5
+  loss_type: fm
+
+  # ---- 学习率与优化器 ----
+  optimizer: adamw
+  fused_optimizer: true
+  lr: 5.0e-05
+  action_policy_lr: 1.0e-4
+  freeze_vision_encoder: true
+  action_loss_weight: 1.0
+  weight_decay: 0.0
+  lr_decay_style: cosine
+  lr_warmup_ratio: 0.03
+  lr_decay_ratio: 1.0
+  lr_min: 5.0e-06
+
+  # ---- 批量、精度与分布式 ----
+  # float32：FP32 主参数 / AdamW，BF16 autocast；部署导出 BF16。
+  parameter_dtype: float32
+  # 每卡 micro batch；显存不足时先减小此值。
+  micro_batch_size: 16
+  gradient_accumulation_steps: 1
+  init_device: cuda
+  data_parallel_mode: fsdp2
+  enable_full_shard: true
+  module_fsdp_enable: true
+  enable_gradient_checkpointing: true
+  rmpad: false
+  rmpad_with_pos_ids: false
+  use_compile: false
+
+  # ---- 训练时长、保存与日志 ----
+  output_dir: outputs/action_multi_pretrain
+  max_steps: 50000
+  save_steps: 5000
+  save_epochs: 11111
+  enable_resume: false
+  use_wandb: false
+
+  # ---- RTC：由 enabled 控制 delay 在 [0, max_delay_steps] 均匀采样 ----
+  rtc_training:
+    enabled: false
+    delay_sampling: uniform

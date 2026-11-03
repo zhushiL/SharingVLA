@@ -1,0 +1,56 @@
+# 机器人原生字段映射：state / action 均按左臂、右臂顺序组合。
+# 当前样例为 20 维 TCP + gripper；arm.position 在训练配置中预留为注释，
+# 若使用臂关节数据，请按实际源字段新增对应映射，不能复用 TCP 的切片。
+states:
+  # ---- 状态：TCP 位姿、夹爪 ----
+  - observation.state.end.position:
+      origin_keys:
+        # Left TCP: xyz + 6D rotation representation.
+        - observation.state:
+            start: 0
+            end: 9
+        # Right TCP: xyz + 6D rotation representation.
+        - observation.state:
+            start: 10
+            end: 19
+
+  - observation.state.effector.position:
+      origin_keys:
+        - observation.state:
+            start: 9
+            end: 10
+        - observation.state:
+            start: 19
+            end: 20
+
+actions:
+  # ---- 动作：相对 TCP 位姿、绝对夹爪 ----
+  - action.end.position:
+      origin_keys:
+        - action:
+            start: 0
+            end: 9
+        - action:
+            start: 10
+            end: 19
+      # Learn delta action TCP poses; each pose is xyz + 6D rotation.
+      subtract_state: true
+
+  - action.effector.position:
+      origin_keys:
+        - action:
+            start: 9
+            end: 10
+        - action:
+            start: 19
+            end: 20
+      subtract_state: false
+
+images:
+  # ---- RGB 相机：头部、左腕、右腕 ----
+  - observation.images.camera_top:
+      origin_keys: observation.images.head
+  - observation.images.camera_wrist_left:
+      origin_keys: observation.images.left_left_wrist
+  - observation.images.camera_wrist_right:
+      origin_keys: observation.images.right_right_wrist

@@ -1,0 +1,23 @@
+# 共用归一化统计：独立策略与完整 VLA 使用同一份 state / action 统计。
+# bash train.sh scripts/compute_norm_stats.py configs/norm_compute/own_robot.yaml
+data:
+  # ---- 数据集与原生字段映射 ----
+  data_name: own_robot
+  robot_name: own_robot
+  train_path: ../data/bi_rebot_09_pick_and_place_1023-annotated
+  robot_config_root: configs/robot_configs
+
+  # ---- 输出与采样 ----
+  norm_path: assets/norm_stats/own_robot.json
+  # 统计使用的样本帧比例：(0,1]；1.0 全量，0.1 随机抽取约 10% 的帧及其完整动作块。
+  data_ratio_for_norm_compute: 1.0
+  # true：相对动作在 chunk 时间维共享统计；false：每个未来步分别统计。state / 绝对动作不受影响。
+  norm_merge_chunk_dim: true
+  num_workers: 8
+
+train:
+  # ---- 批量与动作块长度（应与训练配置保持一致） ----
+  micro_batch_size: 512
+  chunk_size: 50
+  output_dir: outputs/norm_stats
+  max_steps: 100000000
