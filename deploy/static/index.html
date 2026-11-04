@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>SharingVLA · 推理工作台</title><link rel="stylesheet" href="/static/style.css"><script defer src="/static/task-status.js"></script><script defer src="/static/app.js"></script></head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/" aria-label="SharingVLA 首页"><span class="brand-symbol" aria-hidden="true"><i></i><i></i><i></i></span>SharingVLA</a>
+  <span class="active-tab">推理工作台</span>
+  <div class="header-right"><span class="local-badge"><i></i>本地运行</span><details class="network"><summary title="本机 IP 与连接地址"><span class="network-icon">IP</span><span id="primary-ip">127.0.0.1</span><span class="chevron" aria-hidden="true"></span></summary><div class="network-popover"><div class="section-title"><h2>连接地址</h2><span id="client-status" class="muted">未连接</span></div><div id="addresses"></div></div></details></div>
+</header>
+<main>
+  <div class="status-strip"><div class="status-leading"><div><strong id="model-name">未选择权重</strong><small id="model-hint">选择本地 hf_ckpt</small></div></div><div class="strip-metrics"><span>推理 <strong id="latency">—</strong></span><span>RTC <strong id="prefix">—</strong></span><span>Chunk <strong id="chunk">—</strong></span><span id="phase" class="status-badge">未加载</span></div></div>
+  <div id="notice" class="notice" role="status" hidden></div>
+  <section id="workspace" class="workspace">
+    <section class="panel state-panel" aria-label="TCP XYZ">
+      <div class="section-title"><h2>State</h2><span class="small-tag">TCP · XYZ</span></div>
+      <div class="state-legend"><span>X</span><span>Y</span><span>Z</span><small>最近 100 点</small></div>
+      <div id="state-values"><div class="state-placeholder"><span>TCP 1</span><div class="placeholder-values">X —　 Y —　 Z —</div><div class="placeholder-chart"></div></div><div class="state-placeholder"><span>TCP 2</span><div class="placeholder-values">X —　 Y —　 Z —</div><div class="placeholder-chart"></div></div></div>
+    </section>
+    <div class="center-column">
+    <section class="vision-panel panel">
+      <div class="section-title"><h2>Live Observation <span id="freshness" class="muted">等待观测</span></h2><div class="camera-tools"><span class="muted">#<span id="sequence">—</span></span><select id="head-frame" aria-label="头部帧"><option value="current">头部 · 当前帧</option><option value="history">头部 · 历史帧</option></select></div></div>
+      <div id="camera-grid" class="camera-grid"><div class="camera empty-camera"><span class="camera-label">左腕</span><div class="camera-placeholder">等待观测</div></div><div class="camera camera-main empty-camera"><span class="camera-label">头部</span><div class="camera-placeholder">等待观测</div></div><div class="camera empty-camera"><span class="camera-label">右腕</span><div class="camera-placeholder">等待观测</div></div></div>
+      <div class="observation-footer"><span class="status-dot"></span><span id="observation-info">Client 未连接</span></div>
+    </section>
+      <section class="panel task-panel"><div class="section-title"><h2>Task</h2><span id="task-version" class="small-tag">VLA</span></div><label class="sr-only" for="task">下一个任务</label><textarea id="task" rows="3" maxlength="4096" placeholder="输入下一条任务…"></textarea><div class="task-feedback"><span id="task-state" class="task-state" data-tone="idle" role="status">输入任务以开始</span><details id="task-details" class="task-details"><summary>版本详情</summary><div class="task-detail-body"><div class="task-status"><span title="最近点击应用任务后，服务器保存的任务版本">提交 <strong id="submitted">—</strong></span><span title="当前正在推理的任务版本；空闲时显示 —">推理 <strong id="active-task">—</strong></span><span title="最近一次推理生成的动作块对应的任务版本，不表示机器人已执行完成">返回 <strong id="result-task">—</strong></span></div><p id="saved-task" class="saved-task"></p><p class="caption">返回版本仅表示动作块已生成。</p></div></details></div><div class="task-footer"><p id="task-hint" class="caption">下一次推理生效 · 保留 RTC 前缀</p><button id="apply-task" class="primary peach">应用任务</button></div></section>
+    </div>
+    <aside>
+      <section class="panel model-panel"><div class="section-title"><h2>Model</h2><span id="policy-badge" class="small-tag">LOCAL</span></div>
+        <label for="checkpoint-path">权重目录</label><div class="input-row"><input id="checkpoint-path" placeholder="选择 hf_ckpt" autocomplete="off"><button id="browse" class="secondary browse-button" title="选择权重文件夹" aria-label="选择权重文件夹"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5.5A1.5 1.5 0 0 1 4.5 4H9l2 3h8.5A1.5 1.5 0 0 1 21 8.5V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/><path d="M3 10h18"/></svg></button></div>
+        <div class="config-row"><span id="checkpoint-info" class="muted">VLA / Action Policy</span><div class="path-actions"><button id="browse-path" class="text-button">路径选择</button><button id="inspect" class="text-button">检查</button></div></div>
+        <div class="settings"><div><label for="robot">机器人</label><select id="robot" disabled><option>自动识别</option></select></div><div><label for="dtype">精度</label><select id="dtype"><option value="bfloat16">BF16</option><option value="float32">FP32</option></select></div></div>
+        <label class="check" title="首次推理可能较慢"><input id="compile" type="checkbox">torch.compile</label>
+        <div class="button-row"><button id="load" class="primary">加载模型</button><button id="unload" class="secondary" disabled>卸载</button></div>
+      </section>
+
+    </aside>
+  </section>
+</main>
+<dialog id="folder-dialog"><div class="section-title"><h2>选择权重目录</h2><button id="close-folder" class="icon-button" aria-label="关闭目录选择">×</button></div><label for="root">快捷目录 · 服务器本机</label><select id="root"></select><div class="input-row folder-path-row"><button id="parent-folder" class="secondary">上一级</button><input id="folder-path" aria-label="服务器目录路径" placeholder="输入绝对路径" autocomplete="off"><button id="go-folder" class="secondary">前往</button></div><div id="folders" class="folders"></div><p id="folder-error" class="folder-error" role="status" hidden></p><button id="select-folder" class="primary">选择此目录</button></dialog>
+</body></html>

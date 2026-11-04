@@ -1,5 +1,5 @@
 # 独立 action policy 预训练
-# 启动：bash train.sh tasks/train_action_policy.py configs/policy_action/multi_pretrain.yaml
+# 启动：bash train.sh tasks/train_action_policy.py configs/policy_action/pretrain.yaml
 # 配置独立维护；更换数据 / 动作组成后需重新计算 configs/norm_compute/ 下的统计。
 
 model:
@@ -14,6 +14,10 @@ model:
 
 data:
   # ---- 数据集与机器人映射 ----
+  # data_name: own_robot
+  # train_path: ../data/bi_rebot_09_pick_and_place_1023-annotated
+  # robot_config_root: configs/robot_configs
+  # norm_stats_file: assets/norm_stats/own_robot.json
   data_name: multi
   train_path: assets/data_path/multi_pretrain_datasets.txt
   robot_config_root: configs/robot_configs
@@ -80,7 +84,7 @@ train:
   use_compile: false
 
   # ---- 训练时长、保存与日志 ----
-  output_dir: outputs/action_multi_pretrain
+  output_dir: outputs/action_pretrain
   max_steps: 50000
   save_steps: 5000
   save_epochs: 11111

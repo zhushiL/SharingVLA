@@ -51,6 +51,6 @@ images:
   - observation.images.camera_top:
       origin_keys: observation.images.head
   - observation.images.camera_wrist_left:
-      origin_keys: observation.images.left_left_wrist
+      origin_keys: observation.images.left_wrist
   - observation.images.camera_wrist_right:
-      origin_keys: observation.images.right_right_wrist
+      origin_keys: observation.images.right_wrist

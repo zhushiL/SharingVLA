@@ -108,7 +108,9 @@ class VisionProcessor:
         return self.image_processor.save_pretrained(path)
 
 
-def build_image_processor(processor_path: str) -> VisionProcessor:
+def build_image_processor(processor_path: str, *, local_files_only: bool = False) -> VisionProcessor:
     from transformers import AutoImageProcessor
 
-    return VisionProcessor(AutoImageProcessor.from_pretrained(processor_path, trust_remote_code=False))
+    return VisionProcessor(AutoImageProcessor.from_pretrained(
+        processor_path, trust_remote_code=False, local_files_only=local_files_only,
+    ))

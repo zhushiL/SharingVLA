@@ -1,6 +1,6 @@
 # 训练指南
 
-先完成 [环境安装](../README.md#快速开始) 和 [数据准备](data.md)。以下命令从仓库根目录执行。根据显存调整 `train.micro_batch_size`，并把权重路径中的步数替换为实际输出。
+先完成 [环境安装](../README.md#快速开始) 和 [数据准备](data.md)。训练配置仅保留下述四份，单数据集和多数据集通过各配置的 `data` 字段切换。以下命令从仓库根目录执行。根据显存调整 `train.micro_batch_size`，并把权重路径中的步数替换为实际输出。
 
 ## 1. 独立 Action Policy 预训练
 
@@ -9,6 +9,8 @@
 ```bash
 bash train.sh tasks/train_action_policy.py configs/policy_action/pretrain.yaml
 ```
+
+当前 `pretrain.yaml` 使用多数据集清单和合并统计；准备方式见 [多数据集训练](data.md#多数据集训练)。单数据集训练可直接修改同一份配置的 `data` 字段。
 
 需要修改的主要字段：
 
@@ -38,7 +40,9 @@ bash train.sh tasks/train_vla.py configs/policy_vla/mid_train.yaml \
   --model.action_policy_path outputs/action_pretrain/checkpoints/global_step_50000/hf_ckpt/action_policy
 ```
 
-**mid_train 默认开启子任务语言 loss**，包括多数据集示例 `multi_mid_train.yaml`。训练数据需有子任务标注；若只训练动作，可显式关闭：
+当前 `mid_train.yaml` 的 `data_name` 为 `multi`，使用 `assets/data_path/multi_pretrain_datasets.txt` 和对应合并统计。单数据集训练时，按 [数据指南](data.md#配置数据路径) 修改 `data` 字段。
+
+**mid_train 默认开启子任务语言 loss**。训练数据需有子任务标注；若只训练动作，可显式关闭：
 
 ```bash
 bash train.sh tasks/train_vla.py configs/policy_vla/mid_train.yaml \
@@ -67,13 +71,13 @@ bash train.sh tasks/train_vla.py configs/policy_vla/post_train.yaml \
 | 增加有效 batch | 增加 `train.gradient_accumulation_steps` |
 | 减少显存占用 | 先减小 `train.micro_batch_size`，保留梯度检查点 |
 | 调整头部历史 | 完整 VLA 的 `train.head_history_offset`，单位为数据帧 |
-| 多数据集训练 | 使用 `multi_pretrain.yaml` 或 `multi_mid_train.yaml`，见 [数据指南](data.md#多数据集训练) |
+| 多数据集训练 | 在对应阶段配置中设置 `data_name: multi`、数据集清单和合并统计，见 [数据指南](data.md#多数据集训练) |
 
 模块学习率未设置时使用 `train.lr`。独立策略解冻后的视觉编码器也使用 `train.lr`。
 
 默认训练使用 FP32 参数与 AdamW 状态、BF16 autocast。`train.parameter_dtype: bfloat16` 可进一步减少显存，但会改变参数和优化器状态的精度。部署权重统一导出为 BF16。
 
-指定可见 GPU 后，`train.sh` 会按可见数量启动进程：
+未设置 `CUDA_VISIBLE_DEVICES` 和 `NPROC_PER_NODE` 时，`train.sh` 自动使用本机全部 GPU。指定可见 GPU 后，默认按可见数量启动进程；显式设置 `NPROC_PER_NODE` 时以该值为准：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 bash train.sh tasks/train_vla.py configs/policy_vla/mid_train.yaml

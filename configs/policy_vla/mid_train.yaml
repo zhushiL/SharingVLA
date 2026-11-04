@@ -16,14 +16,14 @@ model:
 
 data:
   # ---- 数据集与机器人映射 ----
-  data_name: own_robot
-  train_path: ../data/bi_rebot_09_pick_and_place_1023-annotated
-  robot_config_root: configs/robot_configs
-  norm_stats_file: assets/norm_stats/own_robot.json
-  # data_name: multi
-  # train_path: assets/data_path/multi_pretrain_datasets.txt
+  # data_name: own_robot
+  # train_path: ../data/bi_rebot_09_pick_and_place_1023-annotated
   # robot_config_root: configs/robot_configs
-  # norm_stats_file: assets/norm_stats/multi_pretrain.json
+  # norm_stats_file: assets/norm_stats/own_robot.json
+  data_name: multi
+  train_path: assets/data_path/multi_pretrain_datasets.txt
+  robot_config_root: configs/robot_configs
+  norm_stats_file: assets/norm_stats/multi_pretrain.json
 
   # ---- 动作 / 状态组成（顺序一致；当前数据只有 TCP 与夹爪，共 20 维） ----
   joints:

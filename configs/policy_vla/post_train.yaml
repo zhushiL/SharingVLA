@@ -15,7 +15,7 @@ model:
 
 data:
   # ---- 数据集与机器人映射 ----
-  # 多数据集示例见同目录 multi_*.yaml；后训练也使用相同的 data 配置方式。
+  # 多数据集设置 data_name: multi，并指定数据集清单与合并统计；见 docs/data.md。
   data_name: own_robot
   train_path: ../data/bi_rebot_09_pick_and_place_1023-annotated
   robot_config_root: configs/robot_configs

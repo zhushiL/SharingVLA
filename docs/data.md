@@ -59,7 +59,7 @@ data:
 
 未标注帧使用空文本对应的 ID，只训练动作，不计算语言 loss；不要用 `-1`。有标注帧的目标为当前时刻子任务，最多占 100 个 token，包含 EOS，padding 不计入 loss。
 
-`mid_train.yaml` 和 `multi_mid_train.yaml` 默认开启子任务监督。关闭后不读取子任务标注。独立策略始终不读取任务或子任务。
+`configs/policy_vla/mid_train.yaml` 默认开启子任务监督，`configs/policy_vla/post_train.yaml` 默认关闭。关闭后不读取子任务标注。独立策略始终不读取任务或子任务。
 
 ## 归一化统计
 
@@ -97,14 +97,28 @@ own_robot /data/task_b
 bash train.sh scripts/compute_norm_stats.py configs/norm_compute/multi_pretrain.yaml
 ```
 
-再选择训练入口：
+多数据集训练直接使用现有四份训练配置，在对应配置中设置：
 
-```bash
-bash train.sh tasks/train_action_policy.py configs/policy_action/multi_pretrain.yaml
-bash train.sh tasks/train_vla.py configs/policy_vla/multi_mid_train.yaml
+```yaml
+data:
+  data_name: multi
+  train_path: assets/data_path/multi_pretrain_datasets.txt
+  robot_config_root: configs/robot_configs
+  norm_stats_file: assets/norm_stats/multi_pretrain.json
 ```
 
-两条训练命令按需要分别执行，mid_train 仍需配置已训练的动作权重。后训练也可将 `data_name` 设为 `multi`、`train_path` 指向清单、`norm_stats_file` 指向合并统计。数据按帧拼接并随机采样，不额外设置数据集采样权重。
+当前 `configs/policy_action/pretrain.yaml` 和 `configs/policy_vla/mid_train.yaml` 已使用这些设置，两份 `post_train.yaml` 默认使用单数据集。也可在启动时覆盖，例如：
+
+```bash
+bash train.sh tasks/train_action_policy.py configs/policy_action/pretrain.yaml \
+  --data.data_name multi \
+  --data.train_path assets/data_path/multi_pretrain_datasets.txt \
+  --data.norm_stats_file assets/norm_stats/multi_pretrain.json
+
+bash train.sh tasks/train_vla.py configs/policy_vla/mid_train.yaml
+```
+
+两条训练命令按需要分别执行，mid_train 仍需配置已训练的动作权重。两种后训练使用各自的 `post_train.yaml`，按同样方式设置数据字段，并保留对应的权重初始化配置。数据按帧拼接并随机采样，不额外设置数据集采样权重。
 
 ## 常见问题
 

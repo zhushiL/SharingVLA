@@ -1,6 +1,13 @@
 # 配置参考
 
-从 `configs/policy_action/` 或 `configs/policy_vla/` 选择完整 YAML。配置分为 `model`、`data`、`train`，可直接编辑，也可用命令行覆盖单个字段：
+| 阶段 | 配置文件 |
+| --- | --- |
+| Action Policy 预训练 | `configs/policy_action/pretrain.yaml` |
+| Action Policy 后训练 | `configs/policy_action/post_train.yaml` |
+| 完整 VLA 预训练 | `configs/policy_vla/mid_train.yaml` |
+| 完整 VLA 后训练 | `configs/policy_vla/post_train.yaml` |
+
+单数据集和多数据集共用这四份配置，通过 `data.data_name`、`data.train_path` 和 `data.norm_stats_file` 切换。配置分为 `model`、`data`、`train`，可直接编辑，也可用命令行覆盖单个字段：
 
 ```bash
 bash train.sh tasks/train_vla.py configs/policy_vla/mid_train.yaml \

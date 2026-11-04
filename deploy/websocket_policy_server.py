@@ -1,5 +1,6 @@
 import asyncio
 import http
+import inspect
 import logging
 import os
 import time
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 class WebsocketPolicyServer:
     """Serves a policy using the websocket protocol. See websocket_client_policy.py for a client implementation.
 
-    Currently only implements the `load` and `infer` methods.
+    Accepts reset and inference requests. Policies may implement sync or async infer.
     """
 
     def __init__(
@@ -23,19 +24,27 @@ class WebsocketPolicyServer:
         host: str = "0.0.0.0",
         port: int | None = None,
         metadata: dict | None = None,
+        on_connection_change=None,
     ) -> None:
         self._policy = policy
         self._host = host
         self._port = port
         self._metadata = metadata or {}
         self._active_connection = None
+        self._on_connection_change = on_connection_change
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
         asyncio.run(self.run())
 
     async def run(self):
-        async with _server.serve(
+        server = await self.start()
+        async with server:
+            await server.serve_forever()
+
+    async def start(self):
+        """Bind only when the policy is ready; caller owns server.close()."""
+        return await _server.serve(
             self._handler,
             self._host,
             self._port,
@@ -44,8 +53,7 @@ class WebsocketPolicyServer:
             ping_interval=_optional_float_env("WEBSOCKET_PING_INTERVAL"),
             ping_timeout=_optional_float_env("WEBSOCKET_PING_TIMEOUT"),
             process_request=_health_check,
-        ) as server:
-            await server.serve_forever()
+        )
 
     async def _handler(self, websocket: _server.ServerConnection):
         if self._active_connection is not None:
@@ -54,6 +62,8 @@ class WebsocketPolicyServer:
             return
 
         self._active_connection = websocket
+        if self._on_connection_change:
+            self._on_connection_change(websocket.remote_address)
         logger.info(f"Connection from {websocket.remote_address} opened")
         packer = Packer()
         try:
@@ -70,6 +80,8 @@ class WebsocketPolicyServer:
 
                 infer_time = time.monotonic()
                 action = self._policy.infer(obs)
+                if inspect.isawaitable(action):
+                    action = await action
                 infer_time = time.monotonic() - infer_time
                 reset_received = True
 
@@ -99,6 +111,8 @@ class WebsocketPolicyServer:
         finally:
             if self._active_connection is websocket:
                 self._active_connection = None
+                if self._on_connection_change:
+                    self._on_connection_change(None)
 
 
 def _health_check(connection: _server.ServerConnection, request: _server.Request) -> _server.Response | None:

@@ -116,6 +116,7 @@ def main():
     parser.add_argument("--verify-only", action="store_true", help="Verify previously exported checkpoints without retraining.")
     parser.add_argument("--verify-stage", choices=tuple(STAGES), help=argparse.SUPPRESS)
     parser.add_argument("--sample-index", type=int, default=165)
+    parser.add_argument("--robot-config-root", type=Path, help="Optional robot mappings for the validation dataset; the source configs are unchanged.")
     args = parser.parse_args()
     args.output_dir = args.output_dir.resolve()
     args.data_path = args.data_path.resolve()
@@ -140,6 +141,8 @@ def main():
                        "--train.micro_batch_size", "1", "--train.parameter_dtype", dtype,
                        "--train.seed", "127", "--data.num_workers", "0", "--data.video_backend", "pyav",
                        "--train.performance_log_steps", "1"]
+            if args.robot_config_root:
+                command += ["--data.robot_config_root", str(args.robot_config_root.resolve())]
             if stage != "post_train":
                 command += ["--model.vlm_path", str(args.model_path)]
             if stage in {"action_posttrain", "mid_train"}:

@@ -379,7 +379,7 @@ class RobotPolicy:
         config.tokenizer_path = base_model_path
 
         if config.standalone_action_policy:
-            self.processor = build_image_processor(str(bundled_backbone_path))
+            self.processor = build_image_processor(str(bundled_backbone_path), local_files_only=True)
         else:
             self.processor = AutoProcessor.from_pretrained(
                 str(bundled_backbone_path), padding_side="right",
