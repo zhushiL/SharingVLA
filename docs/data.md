@@ -1,24 +1,34 @@
 # 数据指南
 
-使用 LeRobot v3 数据集。每帧包含 RGB、机器人 state、action 和全局任务；训练子任务语言 loss 时，还需要当前帧的子任务索引。图像仅解码配置选中的相机。
+使用 LeRobot v3 数据集。训练样本包含相机图像、机器人状态和动作；完整 VLA 还需要全局任务文本，启用子任务监督时需要额外标注。
 
-## 配置数据路径
+## 数据配置
 
-单数据集训练设置：
+单数据集训练：
 
 ```yaml
 data:
   data_name: own_robot
-  train_path: ../data/bi_rebot_09_pick_and_place_1023-annotated
+  train_path: /data/task_a
   robot_config_root: configs/robot_configs
   norm_stats_file: assets/norm_stats/own_robot.json
 ```
 
-相对路径以仓库根目录为基准。`data_name` 对应机器人映射文件名，例如 `configs/robot_configs/own_robot.yaml`。
+`data_name` 对应机器人映射文件 `configs/robot_configs/<data_name>.yaml`。`train_path` 可填写本地 LeRobot 目录或 Hugging Face 数据集 ID；相对路径以仓库根目录为基准。
 
-## own_robot 字段映射
+多数据集训练将 `data_name` 设为 `multi`，`train_path` 指向数据清单：
 
-仓库提供一个双臂示例。原生 state 和 action 都是 20 维：
+```yaml
+data:
+  data_name: multi
+  train_path: assets/data_path/multi_robot_datasets.txt
+  robot_config_root: configs/robot_configs
+  norm_stats_file: assets/norm_stats/multi_robot.json
+```
+
+## 机器人字段映射
+
+机器人 YAML 定义原生字段到模型输入的映射。`own_robot.yaml` 的 state/action 均为 20 维：
 
 | 原生切片 | 内容 |
 | --- | --- |
@@ -27,102 +37,66 @@ data:
 | `10:19` | 右 TCP：xyz + 6D rotation |
 | `19:20` | 右夹爪 |
 
-训练将左右 TCP 拼为 18 维，左右夹爪拼为 2 维。TCP 动作默认转换为相对当前 state 的局部位姿，夹爪保持绝对值。部署时会还原为上表的原生顺序。
+映射后，左右 TCP 共 18 维、夹爪共 2 维。TCP 动作转换为相对当前状态的局部位姿，夹爪保持绝对值。
 
-| 逻辑相机 | 数据中的原生字段 |
+| 逻辑相机 | own_robot 原生字段 |
 | --- | --- |
 | `camera_top` | `observation.images.head` |
-| `camera_wrist_left` | `observation.images.left_left_wrist` |
-| `camera_wrist_right` | `observation.images.right_right_wrist` |
+| `camera_wrist_left` | `observation.images.left_wrist` |
+| `camera_wrist_right` | `observation.images.right_wrist` |
 
-独立策略只配置左腕、右腕；完整 VLA 按头部、左腕、右腕配置。VLA 自动读取 `t-head_history_offset` 和 `t` 的头部帧，历史不足时使用该 episode 的首帧。默认图像尺寸为 256×256。
+独立 action policy 使用左右腕相机；完整 VLA 使用头部、左右腕相机，并读取 `t-head_history_offset` 与 `t` 的头部图像。历史不足时使用当前 episode 首帧。
 
-更换机器人时，先修改映射中的原生字段、切片和动作语义，再同步调整训练配置的 `joints`、`norm_type`、`action_dim`、`max_action_dim`、`max_state_dim`。`arm.position` 已保留为注释；只有补齐真实关节字段映射后才能启用。最后重新计算统计。
+`robot1.yaml`、`robot2.yaml`、`robot3.yaml` 分别适配夹爪位于向量末尾、腕相机带重复前缀、全局相机名为 `top` 等字段差异。各数据集使用哪份映射由清单第一列指定。
 
-## 任务与子任务
+接入其他机器人时，核对原生字段、切片、单位和动作语义，并同步调整 `data.joints`、`data.norm_type` 及模型的动作/状态维数。混合训练的数据集应输出一致的逻辑空间。
 
-全局任务始终来自 `task`，作为 72 个 token 的任务输入。子任务是独立监督目标，不替换全局任务。
+## 数据清单与采样
 
-开启 `train.use_subtask_loss` 时，需要：
+每行依次填写机器人配置名、采样比例、数据集路径：
 
-- 数据 parquet 中每帧有整数列 `subtask_index`。
-- `meta/subtasks.parquet` 用文本作为索引，索引名为 `subtask`，并含整数列 `subtask_index`。
-- 表中行位置与 ID 一致，从 0 开始连续编号。
+```text
+own_robot sampling_ratio=1.00 /data/task_a
+robot1 sampling_ratio=0.41 Xense/whiteboard_inspect_1023
+```
 
-例如：
+`sampling_ratio` 取值为 `[0, 1]`：`1.00` 使用全部样本起点，`0` 禁用该行，省略时默认为 `1.0`。支持空行和 `#` 注释；含空格或 `#` 的路径用引号包围。
 
-| subtask（索引文本） | subtask_index |
+采样按比例固定、无放回地选择样本起点，训练时打乱顺序。每个起点对应的连续动作块和历史图像仍从原始数据读取。`data.sampling_seed` 默认为 `42`，训练与归一化统计应保持一致。
+
+| 清单 | 用途 |
 | --- | --- |
-| 空字符串 | 0 |
-| 抓取物体 | 1 |
-| 将物体放入容器 | 2 |
+| `assets/data_path/multi_pretrain_datasets.txt` | 通用多数据集配置 |
+| `assets/data_path/multi_umi_datasets.txt` | TacVerse 腕视角数据，用于独立 action policy |
+| `assets/data_path/multi_robot_datasets.txt` | Xense 机器人数据，包含全局与双腕视角 |
 
-未标注帧使用空文本对应的 ID，只训练动作，不计算语言 loss；不要用 `-1`。有标注帧的目标为当前时刻子任务，最多占 100 个 token，包含 EOS，padding 不计入 loss。
-
-`configs/policy_vla/mid_train.yaml` 默认开启子任务监督，`configs/policy_vla/post_train.yaml` 默认关闭。关闭后不读取子任务标注。独立策略始终不读取任务或子任务。
+清单中的比例可逐行修改。机器人映射、源数据路径及采样比例以清单和对应 YAML 为准。
 
 ## 归一化统计
 
-先修改 `configs/norm_compute/own_robot.yaml` 的数据路径和机器人映射，再执行：
+训练前使用 `scripts/compute_norm_stats.py` 计算统计。单数据集使用 `configs/norm_compute/own_robot.yaml`，多数据集使用 `configs/norm_compute/multi_pretrain.yaml`。
+
+例如，为机器人清单计算合并统计：
 
 ```bash
-bash train.sh scripts/compute_norm_stats.py configs/norm_compute/own_robot.yaml
+bash train.sh scripts/compute_norm_stats.py configs/norm_compute/multi_pretrain.yaml \
+  --data.train_path assets/data_path/multi_robot_datasets.txt \
+  --data.robot_name own_robot,robot1,robot2,robot3 \
+  --data.norm_path assets/norm_stats/multi_robot.json
 ```
 
-结果写入 `data.norm_path`。训练配置的 `data.norm_stats_file` 应指向它。计算时的 `train.chunk_size` 必须与训练一致。
+`data.robot_name` 需包含要参与统计的全部映射名称。统计沿用清单的采样比例；`data.data_ratio_for_norm_compute` 可进一步抽样，正式统计建议为 `1.0`。`data.norm_merge_chunk_dim: true` 让相对动作在不同未来步共享统计。
 
-| 参数 | 用途 | 建议起点 |
-| --- | --- | --- |
-| `data.data_ratio_for_norm_compute` | 随机抽取参与统计的样本帧比例，每帧仍读取完整动作 chunk | 正式统计用 `1.0` |
-| `data.norm_merge_chunk_dim` | 相对动作是否合并 chunk 时间维，共享每个动作维度的统计 | `true` |
+训练配置的 `data.norm_stats_file` 指向统计输出，`train.chunk_size` 与统计时一致。更换数据、映射、采样比例或统计设置后需重新计算；部署使用训练时的同一份统计。
 
-以 `[B,50,18]` 的 TCP 动作为例，`true` 产生 `[18]` 统计；`false` 产生 `[50,18]` 统计。state 始终按特征维统计，绝对动作始终合并时间维。共享统计让各未来步使用同一尺度，适合作为当前策略的默认配置。
+## 任务与子任务
 
-更换数据、映射、动作块长度或统计方式后需重新计算。训练与部署必须使用同一套统计；部署包会自动携带训练所用的文件。
+完整 VLA 的全局任务来自 LeRobot 任务元数据。独立 action policy 不读取任务或子任务文本。
 
-## 多数据集训练
+启用 `train.use_subtask_loss` 时，需要：
 
-编辑 `assets/data_path/multi_pretrain_datasets.txt`，每行一个机器人名和数据集路径：
+- 数据 parquet 中每帧有整数列 `subtask_index`。
+- `meta/subtasks.parquet` 以子任务文本为索引，索引名为 `subtask`，并含整数列 `subtask_index`。
+- 子任务 ID 从 0 连续编号，且与表中行位置一致。未标注帧使用空字符串对应的 ID，不使用 `-1`。
 
-```text
-own_robot /data/task_a
-own_robot /data/task_b
-```
-
-支持空行和 `#` 整行注释。启用的各数据集需使用一致的动作与状态语义、单位和维度。开启子任务监督时，每份数据都需提供上述子任务字段。
-
-先计算合并统计：
-
-```bash
-bash train.sh scripts/compute_norm_stats.py configs/norm_compute/multi_pretrain.yaml
-```
-
-多数据集训练直接使用现有四份训练配置，在对应配置中设置：
-
-```yaml
-data:
-  data_name: multi
-  train_path: assets/data_path/multi_pretrain_datasets.txt
-  robot_config_root: configs/robot_configs
-  norm_stats_file: assets/norm_stats/multi_pretrain.json
-```
-
-当前 `configs/policy_action/pretrain.yaml` 和 `configs/policy_vla/mid_train.yaml` 已使用这些设置，两份 `post_train.yaml` 默认使用单数据集。也可在启动时覆盖，例如：
-
-```bash
-bash train.sh tasks/train_action_policy.py configs/policy_action/pretrain.yaml \
-  --data.data_name multi \
-  --data.train_path assets/data_path/multi_pretrain_datasets.txt \
-  --data.norm_stats_file assets/norm_stats/multi_pretrain.json
-
-bash train.sh tasks/train_vla.py configs/policy_vla/mid_train.yaml
-```
-
-两条训练命令按需要分别执行，mid_train 仍需配置已训练的动作权重。两种后训练使用各自的 `post_train.yaml`，按同样方式设置数据字段，并保留对应的权重初始化配置。数据按帧拼接并随机采样，不额外设置数据集采样权重。
-
-## 常见问题
-
-- **缺少相机字段**：检查机器人 YAML 的原生字段是否与数据 metadata 一致。
-- **找不到子任务**：补齐 `subtask_index` 和 `meta/subtasks.parquet`，或关闭 `train.use_subtask_loss`。
-- **视频解码失败**：确认环境中的 FFmpeg / TorchCodec 可用；也可设置 `data.video_backend: pyav`。
-- **动作维度不匹配**：同时核对机器人切片、`joints`、模型维度与统计文件。
+未标注帧只训练动作。没有子任务标注的数据应设置 `train.use_subtask_loss: false`。`configs/policy_vla/mid_train.yaml` 默认开启该项，`configs/policy_vla/post_train.yaml` 默认关闭。

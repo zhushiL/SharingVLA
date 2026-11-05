@@ -121,6 +121,10 @@ class VLATrainingArguments(PolicyTrainingArguments):
 
 @dataclass
 class PolicyDataArguments(DataArguments):
+    sampling_seed: int = field(
+        default=42,
+        metadata={"help": "Fixed seed for per-dataset frame subsets; shared by training and normalization."},
+    )
     persistent_workers: bool = field(
         default=True,
         metadata={"help": "Keep DataLoader workers alive across iterator recreation."},

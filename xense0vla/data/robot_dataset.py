@@ -224,7 +224,9 @@ class VLADataset(Dataset):
         lerobot_repo_id, lerobot_root = _resolve_lerobot_location(repo_id)
         self.dataset_meta = LeRobotDatasetMetadata(repo_id=lerobot_repo_id, root=lerobot_root)
         available_camera_keys = set(self.dataset_meta.camera_keys)
-        required_camera_sources = set(self.feature_transform.org_features.get("images", []))
+        required_camera_sources = (
+            set() if disabled_image_features else set(self.feature_transform.org_features.get("images", []))
+        )
         missing_camera_sources = sorted(required_camera_sources - available_camera_keys)
         if missing_camera_sources:
             raise ValueError(

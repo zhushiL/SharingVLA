@@ -13,7 +13,7 @@ import torch.multiprocessing as mp
 import torch
 import torch.distributed as dist
 
-from xense0vla.data.multi_dataset import get_all_tasks
+from xense0vla.data.dataset_list import format_dataset_entry, get_all_tasks
 from xense0vla.data import build_vla_dataset
 from xense0vla.utils.normalize import (
     RunningStats,
@@ -179,7 +179,9 @@ if __name__ == "__main__":
     robot_name = args.data.robot_name.split(',') if args.data.robot_name is not None else None
     
     if args.data.data_name == 'multi':
-        data_names, repo_ids = get_all_tasks(args.data.train_path, robot_name)
+        data_names, repo_ids, sampling_ratios = get_all_tasks(
+            args.data.train_path, robot_name, with_sampling_ratios=True
+        )
         if robot_name is None:
             assert len(set(data_names)) == 1
         else:
@@ -187,6 +189,7 @@ if __name__ == "__main__":
                 assert data_name in robot_name
     else:
         data_names, repo_ids = [args.data.data_name], [args.data.train_path]
+        sampling_ratios = [1.0]
         args.data.data_name = 'multi'
 
 
@@ -198,8 +201,8 @@ if __name__ == "__main__":
         dist.barrier()
     filename = os.path.join(tmp_dir, f"tmp_{filename}_rank{rank}.txt")
     with open(filename, 'w') as f:
-        for robot, task in zip(data_names, repo_ids):
-            f.write(f"{robot} {task}\n")
+        for robot, task, sampling_ratio in zip(data_names, repo_ids, sampling_ratios):
+            f.write(format_dataset_entry(robot, task, sampling_ratio) + "\n")
     f.close()
     args.data.train_path = filename
     dataset = _init_dataset_worker(args, data_names)

@@ -1,0 +1,50 @@
+# Xense/whiteboard_inspect_1023、Xense/strap-tape-taccap-0929。
+# 原生 state/action：左 TCP 0:9，右 TCP 9:18，左夹爪 18:19，右夹爪 19:20。
+# TCP 为 xyz + 6D rotation；输出与 own_robot 一致：TCP 18 维 + 夹爪 2 维。
+states:
+  - observation.state.end.position:
+      origin_keys:
+        - observation.state:
+            start: 0
+            end: 9
+        - observation.state:
+            start: 9
+            end: 18
+
+  - observation.state.effector.position:
+      origin_keys:
+        - observation.state:
+            start: 18
+            end: 19
+        - observation.state:
+            start: 19
+            end: 20
+
+actions:
+  - action.end.position:
+      origin_keys:
+        - action:
+            start: 0
+            end: 9
+        - action:
+            start: 9
+            end: 18
+      subtract_state: true
+
+  - action.effector.position:
+      origin_keys:
+        - action:
+            start: 18
+            end: 19
+        - action:
+            start: 19
+            end: 20
+      subtract_state: false
+
+images:
+  - observation.images.camera_top:
+      origin_keys: observation.images.head
+  - observation.images.camera_wrist_left:
+      origin_keys: observation.images.left_wrist
+  - observation.images.camera_wrist_right:
+      origin_keys: observation.images.right_wrist

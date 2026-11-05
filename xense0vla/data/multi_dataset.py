@@ -7,39 +7,11 @@ from tqdm import tqdm
 
 from xense0vla.utils import helper
 
+from .dataset_list import get_all_tasks, sample_frame_indices
 from .robot_dataset import VLADataset
 
 
 logger = helper.create_logger(__name__)
-
-
-def get_all_tasks(task_files, robot_names=None):
-    """Read robot/path lists shared by training and normalization.
-
-    Paths are relative to the working directory (normally the repository root).
-    Blank lines and full-line comments are ignored; paths may contain spaces.
-    """
-    data_names, task_list = [], []
-    for task_file in task_files.split(","):
-        task_file = task_file.strip()
-        if not task_file.lower().endswith(".txt"):
-            raise ValueError(f"Dataset list must be a .txt file: {task_file}")
-        with open(task_file, encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, 1):
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                fields = line.split(maxsplit=1)
-                if len(fields) != 2:
-                    raise ValueError(f"{task_file}:{line_number}: expected 'robot_name /path/to/dataset'.")
-                robot, path = fields
-                if robot_names is not None and robot not in robot_names:
-                    continue
-                data_names.append(robot)
-                task_list.append(path)
-    if not task_list:
-        raise ValueError("The dataset lists contain no enabled datasets matching the requested robots.")
-    return data_names, task_list
 
 
 class MultiVLADataset(Dataset):
@@ -75,8 +47,10 @@ class MultiVLADataset(Dataset):
         self.processor = processor
         self.return_item = return_item
 
-        data_names, repo_ids = get_all_tasks(repo_file)
+        data_names, repo_ids, sampling_ratios = get_all_tasks(repo_file, with_sampling_ratios=True)
         self.data_names, self.repo_ids = data_names, repo_ids
+        self.sampling_ratios = sampling_ratios
+        self.sampling_seed = getattr(dataset_config, "sampling_seed", 42)
         # super().__init__()
         self.tolerances_s = tolerances_s if tolerances_s else dict.fromkeys(repo_ids, 0.0001)
         # Construct the underlying datasets passing everything but `transform` and `delta_timestamps` which
@@ -112,34 +86,51 @@ class MultiVLADataset(Dataset):
 
         self._datasets = _datasets
 
+        self.frame_indices = []
+        self.dataset_num_frames = []
         dataset_start_index = []
         start_index = 0
-        for dataset in self._datasets:
+        for dataset, repo_id, ratio in zip(self._datasets, repo_ids, sampling_ratios):
+            raw_count = dataset.dataset.num_frames
+            indices = sample_frame_indices(raw_count, ratio, seed=self.sampling_seed, dataset_id=repo_id)
+            sampled_count = raw_count if indices is None else len(indices)
+            self.frame_indices.append(indices)
+            self.dataset_num_frames.append(sampled_count)
             dataset_start_index.append(start_index)
-            start_index += dataset.dataset.num_frames
+            start_index += sampled_count
+            logger.info(f"Dataset {repo_id}: sampling_ratio={ratio:g}, frames={raw_count} -> {sampled_count}")
         self.dataset_start_index = dataset_start_index
+        self._num_frames = start_index
 
     @property
     def num_frames(self) -> int:
         """Number of samples/frames."""
+        return self._num_frames
+
+    @property
+    def raw_num_frames(self) -> int:
+        """Frame count before applying per-dataset sampling ratios."""
         return sum(d.dataset.num_frames for d in self._datasets)
 
     @property
     def num_episodes(self) -> int:
-        """Number of episodes."""
+        """Source episode count; ratios select frame starts, not whole episodes."""
         return sum(d.dataset.num_episodes for d in self._datasets)
 
     def __len__(self):
         return self.num_frames
 
     def getdata(self, idx: int) -> dict[str, torch.Tensor]:
-        if idx >= len(self):
+        if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of bounds.")
         # Determine which dataset to get an item from based on the index.
         dataset_idx = np.searchsorted(self.dataset_start_index, np.array([idx]), side="right") - 1
         dataset_idx = dataset_idx[0]
         dataset = self._datasets[dataset_idx]
-        item = dataset.getitem(idx - self.dataset_start_index[dataset_idx])
+        local_idx = idx - self.dataset_start_index[dataset_idx]
+        frame_indices = self.frame_indices[dataset_idx]
+        native_idx = local_idx if frame_indices is None else int(frame_indices[local_idx])
+        item = dataset.getitem(native_idx)
 
         if isinstance(item, list):
             if len(item) != 1:

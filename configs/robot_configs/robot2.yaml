@@ -1,0 +1,49 @@
+# Xense/Cup_Ball_Tracking_1028、Xense/bi_rebot_09_pick_and_place_1023。
+# state/action 与 own_robot 相同；腕相机原生字段带 left_left / right_right 前缀。
+states:
+  - observation.state.end.position:
+      origin_keys:
+        - observation.state:
+            start: 0
+            end: 9
+        - observation.state:
+            start: 10
+            end: 19
+
+  - observation.state.effector.position:
+      origin_keys:
+        - observation.state:
+            start: 9
+            end: 10
+        - observation.state:
+            start: 19
+            end: 20
+
+actions:
+  - action.end.position:
+      origin_keys:
+        - action:
+            start: 0
+            end: 9
+        - action:
+            start: 10
+            end: 19
+      subtract_state: true
+
+  - action.effector.position:
+      origin_keys:
+        - action:
+            start: 9
+            end: 10
+        - action:
+            start: 19
+            end: 20
+      subtract_state: false
+
+images:
+  - observation.images.camera_top:
+      origin_keys: observation.images.head
+  - observation.images.camera_wrist_left:
+      origin_keys: observation.images.left_left_wrist
+  - observation.images.camera_wrist_right:
+      origin_keys: observation.images.right_right_wrist

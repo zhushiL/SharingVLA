@@ -1,0 +1,18 @@
+# Xense 机器人数据：7 个任务，共 1,441,672 帧、860 条 episode（2026-11-05 元数据）。
+# 每行：机器人配置名 sampling_ratio=比例 数据集路径（路径为最后一列）。
+# 仿照 multi_umi_datasets.txt，路径使用完整 Hugging Face 数据集名称。
+# 全部任务少于 1,000,000 帧，sampling_ratio 均为 1.00；可逐行调整，0 表示禁用。
+# own_robot：TCP/夹爪交错排列；head、left_wrist、right_wrist。
+# robot1：左右 TCP 在前、夹爪在末尾；head、left_wrist、right_wrist。
+# robot2：TCP/夹爪交错排列；head、left_left_wrist、right_right_wrist。
+# robot3：左右 TCP 在前、夹爪在末尾；top、left_wrist、right_wrist。
+# 已排除 Xense/bi_elite_cs66_rt_egg_carton_to_tray_1016，保留 fixed 版。
+# 合并归一化统计需设置 data.robot_name: own_robot,robot1,robot2,robot3。
+
+own_robot sampling_ratio=1.00 Xense/bi_elite_cs66_rt_open_egg_carton_1103
+own_robot sampling_ratio=1.00 Xense/bi_elite_cs66_rt_egg_carton_to_tray_1016_fixed
+robot1 sampling_ratio=1.00 Xense/whiteboard_inspect_1023
+robot2 sampling_ratio=1.00 Xense/Cup_Ball_Tracking_1028
+robot2 sampling_ratio=1.00 Xense/bi_rebot_09_pick_and_place_1023
+robot1 sampling_ratio=1.00 Xense/strap-tape-taccap-0929
+robot3 sampling_ratio=1.00 Xense/tron2rt-pnp-0918
