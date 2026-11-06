@@ -38,6 +38,7 @@ bash train.sh tasks/train_vla.py configs/policy_vla/mid_train.yaml \
 | `train.max_action_dim` / `train.max_state_dim` | 模型动作 / 状态维度，包含预留 padding |
 | `train.chunk_size` | 每次生成的动作步数，示例为 50 |
 | `train.num_steps` | 动作去噪步数，示例为 5 |
+| `model.use_state` | 是否向第二层环境 attention 的 KV 拼接投影后的 state token；默认 false，四份配置均关闭 |
 
 相机与原生数据字段映射、统计计算见 [数据指南](data.md)。
 

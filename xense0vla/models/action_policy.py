@@ -20,19 +20,21 @@ from .policy_utils import create_sinusoidal_pos_embedding
 
 
 class EnvironmentEncoder(nn.Module):
-    """Fuse aligned left/right patches, then attend to the robot state."""
+    """Fuse wrist patches, then attend to patches and an optional state token."""
 
     def __init__(self, visual_width, config):
         super().__init__()
         width = config.action_expert_hidden_size
         fused_width = 2 * width
+        self.use_state = config.use_state
         self.wrist_projection = nn.Linear(visual_width, width)
-        self.state_projection = nn.Linear(config.max_state_dim, fused_width)
         self.image_norm = nn.LayerNorm(fused_width)
         self.self_attention = nn.MultiheadAttention(fused_width, config.environment_num_heads, batch_first=True)
-        self.cross_norm = nn.LayerNorm(fused_width)
-        self.state_norm = nn.LayerNorm(fused_width)
-        self.cross_attention = nn.MultiheadAttention(fused_width, config.environment_num_heads, batch_first=True)
+        self.fusion_norm = nn.LayerNorm(fused_width)
+        self.fusion_attention = nn.MultiheadAttention(fused_width, config.environment_num_heads, batch_first=True)
+        if self.use_state:
+            self.state_projection = nn.Linear(config.max_state_dim, fused_width)
+            self.state_norm = nn.LayerNorm(fused_width)
         self.output_projection = nn.Linear(fused_width, width)
 
     def forward(self, wrist_tokens: Tensor, state: Tensor, wrist_mask: Tensor) -> Tensor:
@@ -47,10 +49,12 @@ class EnvironmentEncoder(nn.Module):
         tokens = torch.cat([tokens[:, 0], tokens[:, 1]], dim=-1)
         normalized = self.image_norm(tokens)
         tokens = tokens + self.self_attention(normalized, normalized, normalized, need_weights=False)[0]
-        state_tokens = self.state_norm(self.state_projection(state.to(tokens.dtype)))[:, None]
-        tokens = (
-            tokens + self.cross_attention(self.cross_norm(tokens), state_tokens, state_tokens, need_weights=False)[0]
-        )
+        query = self.fusion_norm(tokens)
+        key_value = query
+        if self.use_state:
+            state_tokens = self.state_norm(self.state_projection(state.to(tokens.dtype)))[:, None]
+            key_value = torch.cat([state_tokens, query], dim=1)
+        tokens = tokens + self.fusion_attention(query, key_value, key_value, need_weights=False)[0]
         return self.output_projection(tokens)
 
 

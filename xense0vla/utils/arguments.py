@@ -64,6 +64,10 @@ class ModelArguments:
         default=3072,
         metadata={"help": "MLP width of the action policy."},
     )
+    use_state: bool = field(
+        default=False,
+        metadata={"help": "Append a projected state token to the second environment attention's keys/values."},
+    )
     joint_attention_backend: Literal["sdpa"] = field(
         default="sdpa",
         metadata={"help": "Attention backend for joint VLM/action MoT layers."},

@@ -33,6 +33,7 @@ class VLAConfig(PretrainedConfig):
         action_expert_intermediate_size=3072,
         action_policy_num_layers=18,
         environment_num_heads=8,
+        use_state=False,
         joint_attention_backend="sdpa",
         backbone_attention_implementation="sdpa",
         vit_attn_implementation=None,
@@ -106,6 +107,7 @@ class VLAConfig(PretrainedConfig):
         self.action_expert_intermediate_size = action_expert_intermediate_size
         self.action_policy_num_layers = action_policy_num_layers
         self.environment_num_heads = environment_num_heads
+        self.use_state = bool(use_state)
         self.joint_attention_backend = joint_attention_backend
         self.backbone_attention_implementation = backbone_attention_implementation
         self.vit_attn_implementation = vit_attn_implementation or backbone_attention_implementation

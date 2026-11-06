@@ -10,6 +10,8 @@ model:
   # ---- 模型结构与注意力后端 ----
   action_expert_hidden_size: 1024
   action_expert_intermediate_size: 3072
+  # 第二层环境 attention 的 KV 是否拼接 state token；false 时为 self-attention。
+  use_state: false
   joint_attention_backend: sdpa
   backbone_attention_implementation: sdpa
   vit_attn_implementation: sdpa

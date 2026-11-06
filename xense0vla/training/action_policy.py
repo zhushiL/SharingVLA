@@ -14,6 +14,7 @@ class ActionModelArguments:
     action_policy_path: Optional[str] = None
     action_expert_hidden_size: int = 1024
     action_expert_intermediate_size: int = 3072
+    use_state: bool = False
     joint_attention_backend: Literal["sdpa"] = "sdpa"
     vit_attn_implementation: str = "sdpa"
 
