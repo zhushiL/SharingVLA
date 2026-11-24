@@ -122,6 +122,15 @@ class FeatureTransform:
             if (entry if isinstance(entry, str) else next(iter(entry))) in active_images
         ]
         if not return_item_befor_padding:
+            joints = self.feature_config.joints
+            if not joints or len(set(joints)) != len(joints):
+                raise ValueError("data.joints must contain a non-empty list of unique features.")
+            self.action_widths_per_arm = []
+            for name in joints:
+                width = self.feature_config.joints_max_dim[name]
+                if not isinstance(width, int) or width <= 0 or width % 2:
+                    raise ValueError(f"data.joints width for {name!r} must be positive and even for two arms.")
+                self.action_widths_per_arm.append(width // 2)
             self.check_robot_config(robot_config)
 
         self.model_config = model_config
@@ -601,6 +610,32 @@ class FeatureTransform:
             batch_dict["raw_images"] = raw_images
         return batch_dict
 
+    def _split_and_pad_action_feature(self, value, name):
+        width = self.feature_config.joints_max_dim[name]
+        actual_width = value.shape[-1]
+        if actual_width > width:
+            raise ValueError(f"Action feature {name!r} has width {actual_width}, above its reserved width {width}.")
+        if actual_width % 2:
+            raise ValueError(f"Action feature {name!r} must have an even width for two arms.")
+        # Keep a separate arm axis so padding lands in the correct arm's slots.
+        arms = value.unflatten(-1, (2, actual_width // 2))
+        if actual_width == width:
+            return arms
+        return F.pad(arms, (0, (width - actual_width) // 2))
+
+    def _pack_action_features(self, features, *, empty):
+        """Pack named features in joints order within each arm. Missing features get padding."""
+        parts = [
+            self._split_and_pad_action_feature(features.get(f"action.{name}", empty), name)
+            for name in self.feature_config.joints
+        ]
+        return torch.cat(parts, dim=-1).flatten(-2)
+
+    def _unpack_action_features(self, packed):
+        arm_width = sum(self.action_widths_per_arm)
+        arms = packed[..., :2 * arm_width].unflatten(-1, (2, arm_width))
+        return arms.split(self.action_widths_per_arm, dim=-1)
+
     def prepare_action_prefix(self, observation, action_prefix):
         """Re-anchor absolute native actions and map them to model action space.
 
@@ -677,30 +712,11 @@ class FeatureTransform:
         if self.normalizer is not None:
             actions = self.normalizer.normalize(actions)
 
-        padded_parts = []
-        for joint_name in self.feature_config.joints:
-            action_key = f"action.{joint_name}"
-            reserved_width = self.feature_config.joints_max_dim[joint_name]
-            if action_key not in self.actions:
-                padded_parts.append(
-                    torch.zeros(
-                        action_prefix.shape[0],
-                        reserved_width,
-                        dtype=action_prefix.dtype,
-                        device=action_prefix.device,
-                    )
-                )
-                continue
-            value = torch.as_tensor(
-                actions[action_key],
-                dtype=action_prefix.dtype,
-                device=action_prefix.device,
-            )
-            pad_width = reserved_width - value.shape[-1]
-            if pad_width < 0:
-                raise ValueError(f"RTC action feature {action_key!r} exceeds its reserved width.")
-            padded_parts.append(F.pad(value, (0, pad_width)))
-        model_prefix = torch.cat(padded_parts, dim=-1)
+        actions = {
+            key: torch.as_tensor(value, dtype=action_prefix.dtype, device=action_prefix.device)
+            for key, value in actions.items()
+        }
+        model_prefix = self._pack_action_features(actions, empty=action_prefix[..., :0])
         if model_prefix.shape[-1] > self.model_config.max_action_dim:
             raise ValueError(
                 "RTC action prefix exceeds model max_action_dim: "
@@ -738,9 +754,7 @@ class FeatureTransform:
     def reverse_pad_and_concat(self, item):
         reverse_item = {}
 
-        # In policy_eval, model output `actions` is always padded to max_action_dim
-        # Pad mask with False at the tail so `actions[:, mask]` selects only the
-        # real joint dims — the padded region is False and contributes nothing.
+        # The masks exclude unused feature slots and trailing model padding.
         state_joint_mask = item["state_joint_mask"]
         assert state_joint_mask.shape[-1] == item["state"].shape[-1]
 
@@ -748,9 +762,10 @@ class FeatureTransform:
         assert action_joint_mask.shape[-1] == item["actions"].shape[-1]
 
         state = item["state"][state_joint_mask]
-        action = item["actions"][:, action_joint_mask]
+        action_parts = self._unpack_action_features(item["actions"])
+        action_masks = self._unpack_action_features(action_joint_mask)
 
-        for k in self.feature_config.joints:
+        for k, action, mask in zip(self.feature_config.joints, action_parts, action_masks, strict=True):
             state_key = f"observation.state.{k}"
             if state_key in self.states:
                 joint_dim = self.normalizer.norm_stats[state_key]["mean"].shape[-1]
@@ -760,10 +775,7 @@ class FeatureTransform:
 
             action_key = f"action.{k}"
             if action_key in self.actions:
-                joint_dim = self.normalizer.norm_stats[action_key]["mean"].shape[-1]
-                reverse_item[action_key] = action[:, :joint_dim]
-                action = action[:, joint_dim:]
-            del action_key
+                reverse_item[action_key] = action[..., mask]
         return reverse_item
 
     def pad_and_concat(self, item, w_action=True):
@@ -802,7 +814,6 @@ class FeatureTransform:
                     raise ValueError(f"Wrist camera {image_key!r} requires [C,H,W], got {tuple(image.shape)}.")
                 images[image_key] = image
 
-        actions, action_joints_pad = [], []
         states, state_joints_pad = [], []
 
         for k in self.feature_config.joints:
@@ -818,33 +829,24 @@ class FeatureTransform:
                 state_joints_pad.append(torch.zeros(self.feature_config.joints_max_dim[k]))
             del state_key
 
-            action_key = f"action.{k}"
-            if action_key in self.actions and w_action:
-                pad_len = self.feature_config.joints_max_dim[k] - item[action_key].shape[-1]
-                assert pad_len >= 0, f"pad_len is negative: {pad_len}"
-                actions.append(F.pad(item[action_key], (0, pad_len)))
-                action_joints_pad.append(F.pad(torch.ones(item[action_key].shape[-1]), (0, pad_len)))
-            elif action_key in self.actions and not w_action:
+        state = torch.cat(states, dim=-1).to(torch.float32)
+        state_joint_mask = torch.cat(state_joints_pad, dim=-1).to(dtype=torch.bool)
+
+        actions, action_masks = {}, {}
+        for action_key in self.actions:
+            if w_action:
+                value = item[action_key]
+            else:
                 assert action_key in self.normalizer.norm_stats, (
                     f"{action_key} not in norm keys: {self.normalizer.norm_stats.keys()}"
                 )
-                actions.append(torch.zeros(self.chunk_size, self.feature_config.joints_max_dim[k]))
-                pad_len = (
-                    self.feature_config.joints_max_dim[k] - self.normalizer.norm_stats[action_key]["mean"].shape[-1]
-                )
-                assert pad_len >= 0, f"pad_len is negative: {pad_len}"
-                action_joints_pad.append(
-                    F.pad(torch.ones(self.normalizer.norm_stats[action_key]["mean"].shape[-1]), (0, pad_len))
-                )
-            else:
-                actions.append(torch.zeros(self.chunk_size, self.feature_config.joints_max_dim[k]))
-                action_joints_pad.append(torch.zeros(self.feature_config.joints_max_dim[k]))
-            del action_key
+                width = self.normalizer.norm_stats[action_key]["mean"].shape[-1]
+                value = torch.zeros(self.chunk_size, width)
+            actions[action_key] = value
+            action_masks[action_key] = value.new_ones((value.shape[-1],), dtype=torch.bool)
 
-        action_joint_mask = torch.cat(action_joints_pad, dim=-1).to(dtype=torch.bool)
-        state_joint_mask = torch.cat(state_joints_pad, dim=-1).to(dtype=torch.bool)
-        state = torch.cat(states, dim=-1).to(torch.float32)
-        action = torch.cat(actions, dim=-1).to(torch.float32)
+        action = self._pack_action_features(actions, empty=torch.empty(self.chunk_size, 0)).to(torch.float32)
+        action_joint_mask = self._pack_action_features(action_masks, empty=torch.empty(0, dtype=torch.bool))
         chunk_joint_mask = action_joint_mask.clone().unsqueeze(0).repeat(self.chunk_size, 1)
 
         batch_dict = {

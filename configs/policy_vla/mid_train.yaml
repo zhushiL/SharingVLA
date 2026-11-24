@@ -27,7 +27,8 @@ data:
   robot_config_root: configs/robot_configs
   norm_stats_file: assets/norm_stats/multi_pretrain.json
 
-  # ---- 动作 / 状态组成（顺序一致；当前数据只有 TCP 与夹爪，共 20 维） ----
+  # ---- 动作 / 状态特征（当前为 TCP 与夹爪，共 20 维） ----
+  # 动作的每项维度前半是左手、后半是右手。模型先拼左手，再拼右手
   joints:
     # - arm.position: 14
     - end.position: 18
