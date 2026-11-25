@@ -44,5 +44,6 @@ rich==14.1.0
 matplotlib==3.10.3
 seaborn==0.13.2
 omegaconf==2.3.0
+addict==2.4.0
 msgpack==1.1.1
 websockets==15.0.1

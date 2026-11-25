@@ -1,6 +1,6 @@
 """Exercise the real training CLIs and exported robot policies on one CUDA GPU.
 
-Uses the complete Qwen3.5-2B and actual robot data. Both training entries use
+Uses DA3-LARGE backbone weights, Qwen3.5-2B weights and recorded robot data. Both training entries use
 the default FP32 parameters/AdamW states and BF16 autocast computation.
 Full VLA training requires more than 32 GiB unless memory is offloaded/sharded.
 Each stage runs in its own process and exports resumable plus deployment weights.
@@ -44,17 +44,18 @@ def verify_deployment(args):
     stage = args.verify_stage
     standalone = stage.startswith("action_")
     policy_class = ActionPolicy if standalone else VLAPolicy
-    policy = policy_class(str(checkpoint(args.output_dir, stage)), chunk_ret=True)
-    robot_name = policy.data_config.data_name
+    path = checkpoint(args.output_dir, stage)
+    policy = policy_class(str(path / "action_policy" if standalone else path), chunk_ret=True, robot_name="own_robot")
+    robot_name = "own_robot"
     if standalone:
         assert policy.language_tokenizer is None
-        assert not hasattr(policy.vla.model.backbone, "qwen35")
-        assert not (checkpoint(args.output_dir, stage) / "vlm_backbone/tokenizer.json").exists()
-    assert all(not p.requires_grad for p in policy.vla.model.backbone.vision_model.parameters())
+        assert policy.processor is None
+        assert not any("qwen35" in name for name, _ in policy.vla.named_parameters())
+        assert not (path / "action_policy" / "vlm_backbone").exists()
     dataset = VLADataset(
         str(args.data_path), robot_name, policy.data_config, policy.data_config.robot_config_root,
         config=policy.config, processor=policy.processor, video_backend="pyav",
-        chunk_size=policy.config.chunk_size, image_size=(256, 256),
+        chunk_size=policy.config.chunk_size,
         feature_transform=policy.vla.feature_transform, return_item=True,
     )
     raw = dataset.dataset[args.sample_index]
@@ -64,20 +65,64 @@ def verify_deployment(args):
     if standalone:
         observation.pop("task", None)
     prefix_events = []
+    caches = []
+    action_layers = policy.vla.model.action_policy.layers
+    prefill_calls = []
+    denoise_calls = []
     if not standalone:
         encode_prefix = policy.vla.model.backbone.encode_prefix
 
-        def traced(hidden, padding, positions, prefix_length):
-            result = encode_prefix(hidden, padding, positions, prefix_length)
+        def traced(hidden, padding, positions, prefix_length, **kwargs):
+            assert kwargs.get("need_outputs", True) is False
+            result = encode_prefix(hidden, padding, positions, prefix_length, **kwargs)
+            assert result[0] is None
             prefix_events.append({"slots": hidden.shape[1], "kv_lengths": [k.shape[2] for k, _ in result[1]]})
+            caches[:] = result[1]
             return result
 
         policy.vla.model.backbone.encode_prefix = traced
+        for index, block in enumerate(action_layers):
+            trainable = not policy.config.freeze_action_policy or (policy.config.unfreeze_mot_layers and index % 3 == 2)
+            assert all(p.requires_grad == trainable for p in block.parameters())
+
+            def check_route(module, inputs, kwargs, index=index):
+                hidden, _, _, mask, cache = inputs
+                is_prefill = bool(kwargs.get("return_kv", False))
+                is_mot = index % 3 == 2
+                if is_prefill:
+                    assert hidden.shape[1] == 64
+                    if is_mot:
+                        prefix = caches[index // 3]
+                        assert cache is prefix
+                        assert mask is not None and mask.shape[-1] == prefix[0].shape[2] + hidden.shape[1]
+                    else:
+                        assert cache is None
+                        assert mask is None
+                    prefill_calls.append(index)
+                else:
+                    assert hidden.shape[1] == policy.config.chunk_size
+                    assert cache is not None
+                    if is_mot:
+                        prefix = caches[index // 3]
+                        prefix_len = prefix[0].shape[2]
+                        assert cache[0].shape[2] == prefix_len + 64 and cache[1].shape[2] == prefix_len + 64
+                        assert torch.equal(cache[0][:, :, :prefix_len], prefix[0].to(cache[0].dtype))
+                        assert torch.equal(cache[1][:, :, :prefix_len], prefix[1].to(cache[1].dtype))
+                        assert mask is not None and mask.shape[-1] == prefix_len + 64 + hidden.shape[1]
+                    else:
+                        assert cache[0].shape[2] == 64 and cache[1].shape[2] == 64
+                        assert mask is None
+                    denoise_calls.append(index)
+
+            block.register_forward_pre_hook(check_route, with_kwargs=True)
     result = policy.infer(observation)
     action = np.asarray(result["action"])
     assert action.shape == (50, 20) and np.isfinite(action).all()
     if not standalone:
-        assert prefix_events == [{"slots": 204, "kv_lengths": [204] * 6}]
+        length = (policy.config.history_memory + 1) * 66 + 72
+        assert prefix_events == [{"slots": length, "kv_lengths": [length] * 6}]
+        assert prefill_calls == list(range(18))
+        assert denoise_calls == list(range(18)) * policy.config.num_steps
     rtc = policy.config.rtc_training_enabled
     if rtc:
         prefix = action[:2].copy()
@@ -111,6 +156,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=ROOT / "outputs/training_entries_gpu")
     parser.add_argument("--data-path", type=Path, default=ROOT.parent / "data/bi_rebot_09_pick_and_place_1023-annotated")
     parser.add_argument("--model-path", type=Path, default=ROOT / "pretrained_models/Qwen3.5-2B")
+    parser.add_argument("--da3-path", type=Path, default=ROOT / "pretrained_models/DA3-LARGE")
     parser.add_argument("--stages", choices=tuple(STAGES), nargs="+", default=list(STAGES))
     parser.add_argument("--parameter-dtype", choices=("float32", "bfloat16"), default="float32")
     parser.add_argument("--verify-only", action="store_true", help="Verify previously exported checkpoints without retraining.")
@@ -137,14 +183,19 @@ def main():
                 raise FileExistsError(f"Use a fresh output directory or --verify-only: {checkpoint(args.output_dir, stage)}")
             command = [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc-per-node=1",
                        f"tasks/train_{kind}.py", config, "--data.train_path", str(args.data_path),
+                       "--data.data_name", "own_robot", "--data.norm_stats_file", str(ROOT / "assets/norm_stats/own_robot.json"),
                        "--train.output_dir", str(args.output_dir / stage), "--train.max_steps", "1",
                        "--train.micro_batch_size", "1", "--train.parameter_dtype", dtype,
                        "--train.seed", "127", "--data.num_workers", "0", "--data.video_backend", "pyav",
                        "--train.performance_log_steps", "1"]
             if args.robot_config_root:
                 command += ["--data.robot_config_root", str(args.robot_config_root.resolve())]
-            if stage != "post_train":
+            if stage == "action_pretrain":
+                command += ["--model.spatial_encoder_path", str(args.da3_path.resolve())]
+            if stage == "mid_train":
                 command += ["--model.vlm_path", str(args.model_path)]
+            if stage == "mid_train":
+                command += ["--train.unfreeze_mot_layers", "true"]
             if stage in {"action_posttrain", "mid_train"}:
                 command += ["--model.action_policy_path", str(checkpoint(args.output_dir, "action_pretrain") / "action_policy")]
             elif stage == "post_train":

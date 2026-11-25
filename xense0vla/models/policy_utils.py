@@ -53,4 +53,22 @@ def sample_rtc_delays(max_valid_prefix: Tensor, max_delay_steps: int) -> Tensor:
     return torch.floor(torch.rand(upper.shape, device=upper.device) * (upper + 1)).long()
 
 
-__all__ = ["create_sinusoidal_pos_embedding", "sample_beta", "sample_rtc_delays"]
+def action_joint_mask(actions: Tensor, joint_mask: Tensor | None, action_dim: int) -> Tensor:
+    if joint_mask is None:
+        valid = torch.arange(actions.shape[-1], device=actions.device) < action_dim
+        return valid.expand_as(actions)
+    if joint_mask.shape != actions.shape:
+        raise ValueError("joint_mask must match the action tensor.")
+    return joint_mask.bool()
+
+
+def sample_clean_prefix(valid_steps: Tensor, max_delay: int) -> Tensor:
+    if max_delay == 0:
+        return torch.zeros_like(valid_steps, dtype=torch.bool)
+    # Keep at least one valid target after the contiguous clean prefix.
+    last_delay = valid_steps.long().cumprod(dim=1).sum(dim=1).sub(1)
+    delays = sample_rtc_delays(last_delay, max_delay)
+    return torch.arange(valid_steps.shape[1], device=valid_steps.device) < delays[:, None]
+
+
+__all__ = ["create_sinusoidal_pos_embedding", "sample_beta", "sample_rtc_delays", "action_joint_mask", "sample_clean_prefix"]

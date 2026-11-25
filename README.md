@@ -1,11 +1,9 @@
 # VLA
 
-基于 Qwen3.5-2B 的机器人动作模型，提供两种可部署的策略：
-
 | 策略 | 输入 | 适用场景 |
 | --- | --- | --- |
-| Action Policy | 左右腕部 RGB、机器人 state | 不需要语言指令的独立控制 |
-| VLA | 历史与当前头部 RGB、左右腕部 RGB、state、任务文本 | 需要语言指令的控制 |
+| Action Policy | 左右腕部 RGB、`observation.state`（用于动作坐标还原） | 不需要语言指令的独立控制 |
+| VLA | 历史与当前头部 RGB、左右腕部 RGB、`observation.state`、任务文本 | 需要语言指令的控制 |
 
 两种策略均输出动作 chunk。VLA 可在训练时监督当前子任务，推理时只生成动作。不使用触觉或未来图像预测。
 
@@ -18,10 +16,14 @@
 ```bash
 bash create_env.sh
 conda activate shilinvla
-python scripts/download_hf_model.py
-```
 
-权重默认下载到 `pretrained_models/Qwen3.5-2B`。安装中断后可用 `bash create_env.sh --resume` 继续；自定义环境名使用 `--env-name NAME`。
+# 下载初始化权重
+python scripts/download_hf_model.py --repo_id depth-anything/DA3-LARGE --local_dir pretrained_models/DA3-LARGE
+python scripts/download_hf_model.py --repo_id Qwen/Qwen3.5-2B --local_dir pretrained_models/Qwen3.5-2B
+```
+安装中断后可用 `bash create_env.sh --resume` 继续；自定义环境名使用 `--env-name NAME`。
+
+独立策略预训练时，用 `pretrained_models/DA3-LARGE` 的权重初始化 `spatial_encoder` 的 Transformer 主干。VLA 组装时另外使用 `pretrained_models/Qwen3.5-2B`。
 
 ### 2. 准备数据
 
@@ -69,13 +71,13 @@ python -m deploy.serve_console
 | 完整 VLA 预训练 | `tasks/train_vla.py` | `configs/policy_vla/mid_train.yaml` | **默认开，可关闭** | 关 |
 | 完整 VLA 后训练 | `tasks/train_vla.py` | `configs/policy_vla/post_train.yaml` | 默认关，可开启 | 开 |
 
-训练配置仅保留上表四份 YAML。RTC、子任务 loss 和冻结设置由各自参数控制；每份 YAML 可独立编辑。单数据集与多数据集共用这四份配置，通过 `data` 字段切换；当前 `pretrain.yaml` 和 `mid_train.yaml` 使用多数据集清单，两份 `post_train.yaml` 使用 `own_robot` 单数据集。设置方式见 [数据指南](docs/data.md#多数据集训练)。
+训练配置仅保留上表四份 YAML。RTC、子任务 loss 和冻结设置由各自参数控制；每份 YAML 可独立编辑。单数据集与多数据集共用这四份配置，通过 `data` 字段切换；当前 `pretrain.yaml` 和 `mid_train.yaml` 使用多数据集清单，两份 `post_train.yaml` 使用 `own_robot` 单数据集。设置方式见 [数据指南](docs/data.md#数据清单与采样)。
 
 ## 模型结构
 
-左右腕部特征各为 1024 维，按左、右顺序拼为 2048 维。图像 self-attention 后，与投影到 2048 维的 state 做 cross-attention，再投影回 1024 维，作为动作噪声前方的环境 token。
+`spatial_encoder` 接收同一时刻左右腕部的两张 224×224 RGB 图像。多视角 Transformer 的最后一层为每腕输出 16×16×1024 的特征。两腕特征按左、右顺序沿通道拼接，经步幅 2、填充 1 的 3×3 卷积下采样至 8×8×2048。随后依次经过 32 组的 `GroupNorm`、`SiLU` 和 1×1 卷积（2048→1024），展平为 64 个 1024 维空间 token。动作网络将这些空间 token 放在 noisy action 前。原始 `state` 仅用于相对/绝对动作坐标转换，不进入神经网络前向。
 
-动作网络使用 18 层全注意力，时间调制采用共享投影和每层偏移表。完整 VLA 使用两张头部图像和 72 个任务 token；开启子任务监督时，训练额外追加 100 个当前子任务 token。MoT 只连接图像和任务的 KV。推理仅运行一次 VLM，随后去噪复用 KV。
+独立动作网络包含 18 层全注意力。完整 VLA 额外用 Qwen3.5-2B 编码头部图像与 72 个任务槽。默认按 t−90、t−60、t−30、t 输入 4 张 256×256 头图。Qwen 的 6 组 KV 按顺序分别进入动作侧第 3、6、9、12、15、18 层。子任务监督使用单独的 100 个槽。VLA 推理时每个 chunk 只运行一次 `spatial_encoder`、VLM 与空间 token 预填充，各去噪步只对动作 token 做前向并复用缓存的空间 token KV 与 VLM KV。
 
 ## 目录与文档
 
@@ -86,7 +88,7 @@ configs/
   norm_compute/        # 共用归一化统计配置
   robot_configs/       # 原生字段映射
 xense0vla/
-  models/              # 模型、环境融合、MoT
+  models/              # 模型、空间融合、MoT
   data/                # 数据读取与变换
   training/            # 训练逻辑与公共循环
   inference/           # 策略推理

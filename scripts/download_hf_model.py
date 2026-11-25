@@ -27,10 +27,15 @@ def main():
     )
     files = []
     for entry in info.siblings:
-        path = destination / entry.rfilename
-        if not path.is_file() or path.stat().st_size != entry.size:
-            raise RuntimeError(f"Missing or incomplete download: {path}")
-        record = {"path": entry.rfilename, "bytes": entry.size}
+        path = (destination / entry.rfilename).resolve()
+        if not path.is_relative_to(destination):
+            raise RuntimeError(f"Refusing path outside destination: {entry.rfilename!r}")
+        if not path.is_file():
+            raise RuntimeError(f"Missing downloaded file: {path}")
+        actual_size = path.stat().st_size
+        if entry.size is not None and actual_size != entry.size:
+            raise RuntimeError(f"Incomplete download ({actual_size} != {entry.size}): {path}")
+        record = {"path": entry.rfilename, "bytes": actual_size}
         if entry.lfs is not None:
             digest = hashlib.sha256()
             with path.open("rb") as handle:

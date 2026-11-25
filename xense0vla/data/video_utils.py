@@ -27,24 +27,57 @@ import pyarrow as pa
 import torch
 import torchvision
 from datasets.features.features import register_feature
+from collections import OrderedDict
 from PIL import Image
+
+_TORCHCODEC_AVAILABLE: bool | None = None
+_DECODER_CACHE_MAX_SIZE = 32
+_DECODER_CACHE_PID: int | None = None
+_DECODER_CACHE: OrderedDict[tuple[str, str], Any] = OrderedDict()
+
+
+def _get_torchcodec_decoder(video_path: Path | str, device: str):
+    """Return a fork-safe, per-worker bounded LRU TorchCodec VideoDecoder."""
+    global _TORCHCODEC_AVAILABLE, _DECODER_CACHE_PID
+    if _TORCHCODEC_AVAILABLE is None:
+        _TORCHCODEC_AVAILABLE = importlib.util.find_spec("torchcodec") is not None
+    if not _TORCHCODEC_AVAILABLE:
+        raise ImportError("torchcodec is required but not available.")
+
+    pid = os.getpid()
+    if _DECODER_CACHE_PID != pid:
+        _DECODER_CACHE.clear()
+        _DECODER_CACHE_PID = pid
+
+    key = (os.fspath(video_path), device)
+    decoder = _DECODER_CACHE.get(key)
+    if decoder is not None:
+        _DECODER_CACHE.move_to_end(key)
+        return decoder
+
+    from torchcodec.decoders import VideoDecoder
+
+    decoder = VideoDecoder(video_path, device=device, seek_mode="approximate")
+    _DECODER_CACHE[key] = decoder
+    if len(_DECODER_CACHE) > _DECODER_CACHE_MAX_SIZE:
+        _DECODER_CACHE.popitem(last=False)
+    return decoder
 
 
 def _timestamps_to_frame_indices(
     timestamps: Sequence[float],
     average_fps: float,
     num_frames: int | None,
+    begin_stream_seconds: float = 0.0,
 ) -> tuple[list[int], list[float]]:
-    """Mirror TorchCodec timestamp conversion and tolerance-query semantics."""
-
+    """Convert timestamps to clamped frame indices while preserving original query timestamps for tolerance checks."""
     query_timestamps = [float(timestamp) for timestamp in timestamps]
-    frame_indices = [round(timestamp * average_fps) for timestamp in query_timestamps]
+    frame_indices = [round((timestamp - begin_stream_seconds) * average_fps) for timestamp in query_timestamps]
     if num_frames is not None and int(num_frames) > 0:
         max_frame_index = int(num_frames) - 1
         frame_indices = [max(0, min(index, max_frame_index)) for index in frame_indices]
-        # The existing scalar helper snaps tolerance queries only when frame
-        # count metadata is available.  Preserve that distinction exactly.
-        query_timestamps = [index / average_fps for index in frame_indices]
+    else:
+        frame_indices = [max(0, index) for index in frame_indices]
     return frame_indices, query_timestamps
 
 
@@ -89,25 +122,31 @@ def decode_video_frames(
 
 
 def decode_video_frames_pyav(video_path, timestamps, tolerance_s):
-    """Decode with PyAV directly, including on torchvision without VideoReader."""
+    """Decode with PyAV directly, converting only frames near queried timestamps to RGB."""
     if not timestamps:
         raise ValueError("Video decoding requires at least one timestamp.")
     loaded_frames, loaded_timestamps = [], []
+    query_floats = [float(ts) for ts in timestamps]
+    min_q = min(query_floats)
+    max_q = max(query_floats)
+    # Only run costly rgb24 conversion on frames close to any queried timestamp.
+    window = max(float(tolerance_s) * 4.0, 0.25)
     with av.open(os.fspath(video_path)) as container:
         stream = container.streams.video[0]
         # Seeking to a preceding keyframe preserves accurate frame selection.
-        container.seek(int(min(timestamps) / stream.time_base), stream=stream, backward=True)
+        container.seek(int(min_q / stream.time_base), stream=stream, backward=True)
         for frame in container.decode(stream):
             if frame.pts is None:
                 continue
             timestamp = float(frame.pts * stream.time_base)
-            loaded_frames.append(torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1))
-            loaded_timestamps.append(timestamp)
-            if timestamp >= max(timestamps):
+            if any(abs(timestamp - q) <= window for q in query_floats):
+                loaded_frames.append(torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1))
+                loaded_timestamps.append(timestamp)
+            if timestamp >= max_q + tolerance_s:
                 break
     if not loaded_frames:
-        raise ValueError(f"No video frames decoded from {video_path}.")
-    query = torch.tensor(timestamps, dtype=torch.float64)
+        raise ValueError(f"No video frames decoded from {video_path} near timestamps {query_floats}.")
+    query = torch.tensor(query_floats, dtype=torch.float64)
     loaded = torch.tensor(loaded_timestamps, dtype=torch.float64)
     distances, indices = (query[:, None] - loaded[None, :]).abs().min(dim=1)
     if not (distances < tolerance_s).all():
@@ -155,36 +194,28 @@ def decode_video_frames_torchvision(
     # set a video stream reader
     # TODO(rcadene): also load audio stream at the same time
     reader = torchvision.io.VideoReader(video_path, "video")
+    try:
+        first_ts = min(timestamps)
+        last_ts = max(timestamps)
+        reader.seek(first_ts, keyframes_only=keyframes_only)
 
-    # set the first and last requested timestamps
-    # Note: previous timestamps are usually loaded, since we need to access the previous key frame
-    first_ts = min(timestamps)
-    last_ts = max(timestamps)
+        loaded_frames = []
+        loaded_ts = []
+        for frame in reader:
+            current_ts = frame["pts"]
+            if log_loaded_timestamps:
+                logging.info(f"frame loaded at timestamp={current_ts:.4f}")
+            loaded_frames.append(frame["data"])
+            loaded_ts.append(current_ts)
+            if current_ts >= last_ts:
+                break
+    finally:
+        if backend == "pyav" and getattr(reader, "container", None) is not None:
+            reader.container.close()
+        reader = None
 
-    # access closest key frame of the first requested frame
-    # Note: closest key frame timestamp is usually smaller than `first_ts` (e.g. key frame can be the first frame of the video)
-    # for details on what `seek` is doing see: https://pyav.basswood-io.com/docs/stable/api/container.html?highlight=inputcontainer#av.container.InputContainer.seek
-    reader.seek(first_ts, keyframes_only=keyframes_only)
-
-    # load all frames until last requested frame
-    loaded_frames = []
-    loaded_ts = []
-    for frame in reader:
-        current_ts = frame["pts"]
-        if log_loaded_timestamps:
-            logging.info(f"frame loaded at timestamp={current_ts:.4f}")
-        loaded_frames.append(frame["data"])
-        loaded_ts.append(current_ts)
-        if current_ts >= last_ts:
-            break
-
-    if backend == "pyav":
-        reader.container.close()
-
-    reader = None
-
-    query_ts = torch.tensor(timestamps)
-    loaded_ts = torch.tensor(loaded_ts)
+    query_ts = torch.tensor(timestamps, dtype=torch.float64)
+    loaded_ts = torch.tensor(loaded_ts, dtype=torch.float64)
 
     # compute distances between each query timestamp and timestamps of all loaded frames
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
@@ -235,36 +266,33 @@ def decode_video_frames_torchcodec(
     can be adjusted during encoding to take into account decoding time and video size in bytes.
     """
 
-    if importlib.util.find_spec("torchcodec"):
-        from torchcodec.decoders import VideoDecoder
-    else:
-        raise ImportError("torchcodec is required but not available.")
-    # initialize video decoder
-    decoder = VideoDecoder(video_path, device=device, seek_mode="approximate")
-    loaded_frames = []
-    loaded_ts = []
-    # get metadata for frame information
+    decoder = _get_torchcodec_decoder(video_path, device=device)
     metadata = decoder.metadata
     average_fps = metadata.average_fps
-
+    begin_stream_seconds = float(getattr(metadata, "begin_stream_seconds", 0.0) or 0.0)
     num_frames = getattr(metadata, "num_frames", None)
-    frame_indices, timestamps = _timestamps_to_frame_indices(
+    frame_indices, query_timestamps = _timestamps_to_frame_indices(
         timestamps,
         average_fps,
         num_frames,
+        begin_stream_seconds=begin_stream_seconds,
     )
 
-    # retrieve frames based on indices
-    frames_batch = decoder.get_frames_at(indices=frame_indices)
+    # Deduplicate clamped frame indices (common at episode starts with history
+    # offsets) so repeated frames are decoded once instead of multiple times.
+    unique_indices = list(dict.fromkeys(frame_indices))
+    frames_batch = decoder.get_frames_at(indices=unique_indices)
 
+    loaded_frames = []
+    loaded_ts = []
     for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=False):
         loaded_frames.append(frame)
         loaded_ts.append(pts.item())
         if log_loaded_timestamps:
             logging.info(f"Frame loaded at timestamp={pts:.4f}")
 
-    query_ts = torch.tensor(timestamps)
-    loaded_ts = torch.tensor(loaded_ts)
+    query_ts = torch.tensor(query_timestamps, dtype=torch.float64)
+    loaded_ts = torch.tensor(loaded_ts, dtype=torch.float64)
 
     # compute distances between each query timestamp and loaded timestamps
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
@@ -330,8 +358,8 @@ def encode_video_frames(
     # Define video output frame size (assuming all input frames are the same size)
     if len(input_list) == 0:
         raise FileNotFoundError(f"No images found in {imgs_dir}.")
-    dummy_image = Image.open(input_list[0])
-    width, height = dummy_image.size
+    with Image.open(input_list[0]) as dummy_image:
+        width, height = dummy_image.size
 
     # Define video codec options
     video_options = {}
@@ -361,8 +389,9 @@ def encode_video_frames(
 
         # Loop through input frames and encode them
         for input_data in input_list:
-            input_image = Image.open(input_data).convert("RGB")
-            input_frame = av.VideoFrame.from_image(input_image)
+            with Image.open(input_data) as pil_image:
+                input_image = pil_image.convert("RGB")
+                input_frame = av.VideoFrame.from_image(input_image)
             packet = output_stream.encode(input_frame)
             if packet:
                 output.mux(packet)

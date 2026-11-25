@@ -55,6 +55,12 @@ def parallel_load_safetensors(
         assert os.path.exists(param_file), f"Cannot find {param_file}"
         states = load_file(param_file)
         for param_name in states:
+            if specific_param_name is not None:
+                if param_name not in specific_param_name:
+                    continue
+            elif ignore_param_name is not None:
+                if param_name in ignore_param_name:
+                    continue
             safetensors2param.setdefault("model.safetensors", []).append(param_name)
         del states
 

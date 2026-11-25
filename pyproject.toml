@@ -8,7 +8,7 @@ dynamic = ["version", "dependencies"]
 authors = [
   { name="Robbyant Team"},
 ]
-description = "Qwen3.5 MoT VLA and independent wrist/state action policy"
+description = "Dual-wrist action policy and Qwen3.5 MoT VLA with a shared spatial_encoder"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

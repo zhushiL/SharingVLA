@@ -30,7 +30,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, TypeVar, Union,
 import yaml
 
 from . import logging
-from .runtime_assets import TRAINING_CONFIG_NAME, resolve_backbone_source
+from .runtime_assets import TRAINING_CONFIG_NAME
 
 
 T = TypeVar("T")
@@ -56,18 +56,6 @@ class ModelArguments:
         default=None,
         metadata={"help": "Pretrained action_policy export; required when initializing a complete VLA from Qwen."},
     )
-    action_expert_hidden_size: int = field(
-        default=1024,
-        metadata={"help": "Hidden width of the action policy."},
-    )
-    action_expert_intermediate_size: int = field(
-        default=3072,
-        metadata={"help": "MLP width of the action policy."},
-    )
-    use_state: bool = field(
-        default=False,
-        metadata={"help": "Append a projected state token to the second environment attention's keys/values."},
-    )
     joint_attention_backend: Literal["sdpa"] = field(
         default="sdpa",
         metadata={"help": "Attention backend for joint VLM/action MoT layers."},
@@ -87,7 +75,6 @@ class ModelArguments:
                 raise ValueError("model_path loads a complete VLA checkpoint; do not also set vlm_path/action_policy_path.")
             if self.tokenizer_path is not None:
                 raise ValueError("Use the processor bundled with model_path.")
-            self.tokenizer_path = resolve_backbone_source(self.model_path)
         else:
             if not self.vlm_path:
                 raise ValueError("Provide model_path, or vlm_path together with action_policy_path.")
@@ -354,8 +341,8 @@ class TrainingArguments:
         metadata={"help": "Enable full determinism."},
     )
     empty_cache_steps: int = field(
-        default=500,
-        metadata={"help": "Number of steps between two empty cache operations."},
+        default=0,
+        metadata={"help": "Number of steps between CUDA allocator cache flushes; 0 disables periodic flushes."},
     )
     data_parallel_mode: Literal["ddp", "fsdp1", "fsdp2"] = field(
         default="ddp",
@@ -526,7 +513,11 @@ class TrainingArguments:
         self.model_assets_dir = os.path.join(self.output_dir, "model_assets")
 
     def compute_train_steps(
-        self, max_seq_len: Optional[int] = None, train_size: Optional[int] = None, dataset_length: Optional[int] = None
+        self,
+        max_seq_len: Optional[int] = None,
+        train_size: Optional[int] = None,
+        dataset_length: Optional[int] = None,
+        drop_last: bool = True,
     ) -> None:
         """
         Computes the training steps per epoch according to the data length.
@@ -538,7 +529,15 @@ class TrainingArguments:
             eff_token_rate = (token_micro_bsz - self.dyn_bsz_margin) / token_micro_bsz
             self._train_steps = math.ceil(train_size / (self.global_batch_size * max_seq_len * eff_token_rate))
         elif dataset_length is not None:
-            self._train_steps = math.floor(dataset_length / (self.dataloader_batch_size * self.world_size))  # assuming drop_last is true
+            if drop_last:
+                self._train_steps = math.floor(dataset_length / self.global_batch_size)
+            else:
+                self._train_steps = math.ceil(dataset_length / self.global_batch_size)
+            if self._train_steps < 1:
+                raise ValueError(
+                    f"Dataset length ({dataset_length}) yields 0 training steps with "
+                    f"global_batch_size={self.global_batch_size} and drop_last={drop_last}."
+                )
         elif self.max_steps is not None:
             self._train_steps = self.max_steps
         else:
@@ -666,7 +665,7 @@ def parse_args(rootclass: T) -> T:
 
             elif isclass(origin_type) and issubclass(origin_type, list):
                 parser_kwargs["type"] = attr_type.__args__[0]
-                parser_kwargs["nargs"] = "+"
+                parser_kwargs["nargs"] = "*"
                 list_fields.add(f"{base}.{attr.name}")
                 if attr.default_factory is not MISSING:
                     parser_kwargs["default"] = attr.default_factory()
@@ -693,26 +692,32 @@ def parse_args(rootclass: T) -> T:
             parser.add_argument(f"--{base}.{attr.name}", **parser_kwargs)
 
     cmd_args = sys.argv[1:]
-    cmd_args_string = "=".join(cmd_args)  # use `=` to mark the end of arg name
     input_data = {}
     if cmd_args and (cmd_args[0].endswith(".yaml") or cmd_args[0].endswith(".yml")):
         input_path = cmd_args.pop(0)
         with open(os.path.abspath(input_path), encoding="utf-8") as f:
-            input_data: Dict[str, Dict[str, Any]] = yaml.safe_load(f)
+            input_data: Dict[str, Dict[str, Any]] = yaml.safe_load(f) or {}
 
     elif cmd_args and cmd_args[0].endswith(".json"):
         input_path = cmd_args.pop(0)
         with open(os.path.abspath(input_path), encoding="utf-8") as f:
-            input_data: Dict[str, Dict[str, Any]] = json.load(f)
+            input_data: Dict[str, Dict[str, Any]] = json.load(f) or {}
+
+    # Track explicit CLI option names (including valueless boolean flags at the end)
+    # so YAML values never override CLI flags.
+    cli_flags = {token.split("=", 1)[0] for token in cmd_args if token.startswith("--")}
 
     for base, arg_dict in input_data.items():
+        if not isinstance(arg_dict, dict):
+            continue
         for arg_name, arg_value in arg_dict.items():
-            if f"--{base}.{arg_name}=" not in cmd_args_string:  # lower priority
-                # Skip list fields with None values to use default
-                if f"{base}.{arg_name}" in list_fields and arg_value is None:
+            flag = f"--{base}.{arg_name}"
+            if flag not in cli_flags:  # lower priority
+                # Skip explicit YAML nulls so Optional[...] defaults remain None.
+                if arg_value is None:
                     continue
 
-                cmd_args.append(f"--{base}.{arg_name}")
+                cmd_args.append(flag)
                 if f"{base}.{arg_name}" in list_fields and isinstance(arg_value, list):
                     # For list fields, extend the arguments with individual elements
                     cmd_args.extend([str(item) for item in arg_value])

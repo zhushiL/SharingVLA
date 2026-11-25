@@ -24,7 +24,12 @@ from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import create_selective_checkpoint_contexts
 
-from ..models.module_utils import initialize_model_weights, load_model_weights
+from ..models.module_utils import (
+    cast_model_parameters_dtype,
+    initialize_model_weights,
+    load_model_weights,
+    materialize_dcp_model,
+)
 from ..utils import logging
 from .checkpoint import CheckpointFunction
 from .fsdp import (
@@ -35,7 +40,10 @@ from .fsdp import (
 from .parallel_state import get_parallel_state
 
 
-from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+try:
+    from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
+except ImportError:
+    from torch.distributed._composable.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor.parallel import parallelize_module
 
 
@@ -82,7 +90,8 @@ def build_parallelize_model(
     if weights_path is None and deferred_load is not None:
         weights_path = deferred_load["weights_path"]
 
-    if not parallel_state.fsdp_enabled:
+    is_fsdp = parallel_state.fsdp_enabled and parallel_state.dp_mode in {"fsdp1", "fsdp2"}
+    if not is_fsdp:
         if kwargs.get("init_device") != "cuda":
             raise ValueError("Only FSDP training supports `init_device=cpu` or `init_device=meta`.")
         if kwargs.pop("enable_fsdp_offload", False):
@@ -91,10 +100,10 @@ def build_parallelize_model(
     if parameter_dtype is not None:
         if parameter_dtype not in {"float32", "bfloat16"}:
             raise ValueError("parameter_dtype must be float32 or bfloat16.")
-        model = model.to(dtype=getattr(torch, parameter_dtype))
+        cast_model_parameters_dtype(model, getattr(torch, parameter_dtype))
     elif enable_mixed_precision:
-        # Preserve the historical FP32 optimizer default for other callers.
-        model = model.float()
+        # Preserve the historical FP32 optimizer default while keeping non-persistent buffers intact.
+        cast_model_parameters_dtype(model, torch.float32)
 
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         logger.info_rank0("Enable gradient checkpointing.")
@@ -153,12 +162,17 @@ def build_parallelize_model(
                 "reshard_after_forward": enable_full_shard,
                 **kwargs.pop("fsdp_kwargs", {}),
             }
+            if kwargs.pop("enable_fsdp_offload", False):
+                logger.info_rank0("Enable FSDP2 CPU offloading for parameters & gradients.")
+                fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
+            enable_prefetch = bool(kwargs.pop("enable_forward_prefetch", False))
             if enable_mixed_precision:
                 logger.info_rank0("Enable BF16 mixed precision training.")
+                # Keep output_dtype=None so root scalar losses stay in FP32.
                 mp_policy = MixedPrecisionPolicy(
                     param_dtype=torch.bfloat16,
                     reduce_dtype=torch.float32,
-                    output_dtype=torch.bfloat16,
+                    output_dtype=None,
                 )
                 fsdp_kwargs["mp_policy"] = mp_policy
             if ignore_norm:
@@ -175,6 +189,7 @@ def build_parallelize_model(
             )() or ()
             ignore_modules_in_mixed_precision = tuple(ignored_module_classes)
             basic_module_names = set(basic_modules or ())
+            sharded_submodules: List[nn.Module] = []
 
             def apply_fsdp_to_decoder_blocks(module: "nn.Module") -> None:
                 if (
@@ -190,6 +205,7 @@ def build_parallelize_model(
                             if key != "mp_policy"
                         }
                     fully_shard(module, **module_fsdp_kwargs)
+                    sharded_submodules.append(module)
 
             if basic_module_names:
                 model.apply(apply_fsdp_to_decoder_blocks)
@@ -207,12 +223,12 @@ def build_parallelize_model(
                 logger.info_rank0(f"Applying FSDP2 to {len(blocks)} model blocks.")
                 for block in blocks:
                     fully_shard(block, **module_local_fsdp_kwargs(block, fsdp_kwargs))
+                    sharded_submodules.append(block)
 
             if vlm_fsdp and not basic_module_names:
-                loader_factory = getattr(type(model), "get_weight_loader", None)
-                if loader_factory is None:
-                    raise TypeError("vlm_fsdp=True requires the model to provide get_weight_loader().")
-                vlm = loader_factory().get_vlm_submodule(model)
+                if model.model.backbone is None:
+                    raise ValueError("vlm_fsdp requires a complete VLA.")
+                vlm = model.model.backbone.qwen35
                 block_names = set(
                     getattr(vlm, "_no_split_modules", ())
                     or getattr(model, "_no_split_modules", ())
@@ -229,6 +245,7 @@ def build_parallelize_model(
                 logger.info_rank0(f"Applying FSDP2 to {len(blocks)} VLM blocks.")
                 for block in blocks:
                     fully_shard(block, **module_local_fsdp_kwargs(block, fsdp_kwargs))
+                    sharded_submodules.append(block)
             elif vlm_fsdp:
                 logger.info_rank0(
                     "vlm_fsdp is already covered by module-level FSDP; "
@@ -237,8 +254,17 @@ def build_parallelize_model(
 
             fully_shard(model, **fsdp_kwargs)
 
+            if enable_prefetch and len(sharded_submodules) > 1:
+                for prev_mod, next_mod in zip(sharded_submodules[:-1], sharded_submodules[1:]):
+                    if hasattr(prev_mod, "set_modules_to_forward_prefetch"):
+                        prev_mod.set_modules_to_forward_prefetch([next_mod])
+                    if hasattr(next_mod, "set_modules_to_backward_prefetch"):
+                        next_mod.set_modules_to_backward_prefetch([prev_mod])
+
             if kwargs.get("init_device") == "meta":
-                if weights_path is None:
+                if getattr(model, "_restore_from_dcp", False):
+                    materialize_dcp_model(model, "cuda")
+                elif weights_path is None:
                     # shard init empty model with fsdp2
                     model.to_empty(device="cuda")
                     initialize_model_weights(model)
@@ -251,7 +277,6 @@ def build_parallelize_model(
                         weights_path,
                         "cuda",
                         dtensor_factory=distribute_tensor,
-                        load_vlm_only=bool(load_kwargs.get("load_vlm_only", False)),
                         load_full_checkpoint=bool(load_kwargs.get("load_full_checkpoint", False)),
                     )
                     if hasattr(model, "_deferred_weight_load"):
@@ -302,6 +327,8 @@ def build_parallelize_model(
                 fsdp_kwargs["sync_module_states"] = True
                 if parallel_state.global_rank != 0:
                     fsdp_kwargs["param_init_fn"] = init_fsdp_fn(model, device="cuda")
+            elif kwargs.get("init_device") == "meta" and getattr(model, "_restore_from_dcp", False):
+                fsdp_kwargs["param_init_fn"] = init_fsdp_fn(model, device="cuda")
             elif kwargs.get("init_device") == "meta":
                 # assert weights_path is not None, "`weights_path` must be provided when `init_device=meta` for fsdp1."
 
@@ -312,9 +339,9 @@ def build_parallelize_model(
                         "FSDP1 meta initialization requires weights_path or state_dict. "
                         "Use init_device='cuda' to initialize a dense model from scratch."
                     )
-                if deferred_load is not None and deferred_load.get("load_vlm_only", False):
+                if deferred_load is not None and not deferred_load["load_full_checkpoint"]:
                     raise ValueError(
-                        "FSDP1 meta initialization cannot map a standalone VLM checkpoint "
+                        "FSDP1 meta initialization cannot map separate pretrained components "
                         "into the composite dense model. Use init_device='cuda'/'cpu' or FSDP2."
                     )
                 if weights_path and not os.path.isdir(weights_path):
@@ -344,16 +371,16 @@ def build_parallelize_model(
 
             verbose_fsdp_grouping(model)
         else:
-            ddp_kwargs = {"device_ids": [parallel_state.local_rank]}
-            if enable_mixed_precision:
-                logger.info_rank0("Enable BF16 mixed precision training.")
-                mixed_precision = MixedPrecision(
-                    param_dtype=torch.bfloat16,
-                    reduce_dtype=torch.float32,
-                    buffer_dtype=torch.bfloat16,
-                )
-                ddp_kwargs["mixed_precision"] = mixed_precision
-
-            model = DDP(model, **ddp_kwargs)
+            # The training loop already autocasts the forward pass. DDP reduces
+            # gradients in the optimizer parameter dtype.
+            device = next(model.parameters()).device
+            device_ids = None if device.type == "cpu" else [device.index]
+            model = DDP(
+                model,
+                device_ids=device_ids,
+                # Without a language target, the last Qwen block contributes K/V
+                # but its Q, output projection, MLP and final norm have no loss path.
+                find_unused_parameters=not (model.config.standalone_action_policy or model.config.use_subtask_loss),
+            )
 
     return model

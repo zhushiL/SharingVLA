@@ -154,7 +154,7 @@ class ParallelState:
         if self.device_mesh is not None:
             return self.device_mesh["dp"]
 
-        raise self.fsdp_mesh
+        return self.fsdp_mesh
 
     @property
     def dp_enabled(self) -> bool:

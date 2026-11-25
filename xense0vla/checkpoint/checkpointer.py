@@ -111,6 +111,15 @@ class DistributedCheckpointer(CheckpointerBase):
     Distributed checkpointer for torch.distributed.checkpoint
     """
 
+    _async_futures: list = []
+
+    @classmethod
+    def wait_async_saves(cls) -> None:
+        """Block until all previously scheduled asynchronous DCP saves finish."""
+        while cls._async_futures:
+            future = cls._async_futures.pop(0)
+            future.result()
+
     @classmethod
     def save(
         cls,
@@ -131,46 +140,47 @@ class DistributedCheckpointer(CheckpointerBase):
             None
         """
 
+        cls.wait_async_saves()
         checkpoint_dir = f"{path}/global_step_{global_steps}" if global_steps else path
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         if "model" not in state:
             raise ValueError("Model must be provided to save a distributed checkpoint.")
 
+        def safe_create_writer(output_dir):
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                tmp_path = Path(output_dir) / ".metadata.tmp"
+                try:
+                    tmp_path.unlink()
+                    logger.warning(f"Removed stale temporary metadata file: {tmp_path}")
+                except FileNotFoundError:
+                    pass
+            if dist.is_initialized():
+                dist.barrier()
+            return FileSystemWriter(
+                output_dir,
+                thread_count=16,
+                single_file_per_rank=True,
+                sync_files=False,
+            )
+
         if save_async:
             model_dir = os.path.join(checkpoint_dir, _MODEL_DIR)
-            dcp.async_save(
-                state_dict={"state": ModelState(state["model"])},
-                storage_writer=FileSystemWriter(
-                    model_dir,
-                    thread_count=16,
-                    single_file_per_rank=True,
-                    sync_files=False,
-                ),
+            cls._async_futures.append(
+                dcp.async_save(
+                    state_dict={"state": ModelState(state["model"])},
+                    storage_writer=safe_create_writer(model_dir),
+                )
             )
             if "optimizer" in state:
                 optimizer_dir = os.path.join(checkpoint_dir, _OPTIMIZER_DIR)
-                dcp.async_save(
-                    state_dict={"state": OptimizerState(model=state["model"], optimizer=state["optimizer"])},
-                    storage_writer=FileSystemWriter(
-                        optimizer_dir,
-                        thread_count=16,
-                        single_file_per_rank=True,
-                        sync_files=False,
-                    ),
+                cls._async_futures.append(
+                    dcp.async_save(
+                        state_dict={"state": OptimizerState(model=state["model"], optimizer=state["optimizer"])},
+                        storage_writer=safe_create_writer(optimizer_dir),
+                    )
                 )
         else:
-            def safe_create_writer(output_dir):
-                tmp_path = Path(output_dir) / ".metadata.tmp"
-                if tmp_path.exists():
-                    print(f"Warning: removing existing tmp file: {tmp_path}")
-                    tmp_path.unlink()  # remove .metadata.tmp
-                return FileSystemWriter(
-                    output_dir,
-                    thread_count=16,
-                    single_file_per_rank=True,
-                    sync_files=False,
-                )
             model_dir = os.path.join(checkpoint_dir, _MODEL_DIR)
             storage_writer = safe_create_writer(model_dir)
             dcp.save(
@@ -181,14 +191,8 @@ class DistributedCheckpointer(CheckpointerBase):
                 optimizer_dir = os.path.join(checkpoint_dir, _OPTIMIZER_DIR)
                 dcp.save(
                     state_dict={"state": OptimizerState(model=state["model"], optimizer=state["optimizer"])},
-                    storage_writer=FileSystemWriter(
-                        optimizer_dir,
-                        thread_count=16,
-                        single_file_per_rank=True,
-                        sync_files=False,
-                    ),
+                    storage_writer=safe_create_writer(optimizer_dir),
                 )
-                # dist.barrier()
 
         if "extra_state" in state:
             extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
@@ -269,10 +273,11 @@ class DistributedCheckpointer(CheckpointerBase):
 
         if "extra_state" in state:
             extra_state_dir = os.path.join(checkpoint_dir, _EXTRA_STATE_DIR)
-            os.makedirs(extra_state_dir, exist_ok=True)
             extra_state_path = os.path.join(extra_state_dir, _EXTRA_STATE_FORMAT.format(dist.get_rank()))
             state["extra_state"] = torch.load(
                 extra_state_path,
+                map_location="cpu",
+                weights_only=False,
             )
 
         logger.info_rank0(f"Loaded checkpoint from {checkpoint_dir}")

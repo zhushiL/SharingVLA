@@ -3,6 +3,7 @@ import numpy as np
 import os
 import sys
 import random
+import tempfile
 from pathlib import Path
 from datetime import timedelta
 from tqdm import tqdm
@@ -14,7 +15,7 @@ import torch
 import torch.distributed as dist
 
 from xense0vla.data.dataset_list import format_dataset_entry, get_all_tasks
-from xense0vla.data import build_vla_dataset
+from xense0vla.data.dataset import build_vla_dataset
 from xense0vla.utils.normalize import (
     RunningStats,
     RunningStatsState,
@@ -89,6 +90,26 @@ def get_batch_indices(target_ids, batch_size):
     return [target_ids[i:i + batch_size] for i in range(0, len(target_ids), batch_size)]
 
 
+def _update_stats_from_batch(batch, stats, state_norm_keys, acton_norm_keys, delta_norm, norm_merge_chunk_dim):
+    for key in state_norm_keys:
+        values = np.asarray(batch[key])
+        stats[key].update(values.reshape(-1, values.shape[-1]))
+    valid_action_mask = None
+    if "action_is_pad" in batch:
+        valid_action_mask = ~np.asarray(batch["action_is_pad"], dtype=bool)
+    for key in acton_norm_keys:
+        raw_values = np.asarray(batch[key])
+        if not delta_norm[key] or norm_merge_chunk_dim:
+            if valid_action_mask is not None and raw_values.ndim == 3 and valid_action_mask.shape == raw_values.shape[:2]:
+                values = raw_values[valid_action_mask]
+            else:
+                values = raw_values.reshape(-1, raw_values.shape[-1])
+        else:
+            values = raw_values.reshape(raw_values.shape[0], -1)
+        if values.shape[0] > 0:
+            stats[key].update(values)
+
+
 def compute_norm(dataset, batch_size, stats, state_norm_keys, acton_norm_keys, delta_norm, ratio,
                  rank=0, world_size=1, num_workers=8, norm_merge_chunk_dim=False):
     if ratio < 1:
@@ -103,17 +124,28 @@ def compute_norm(dataset, batch_size, stats, state_norm_keys, acton_norm_keys, d
     # Strided slicing by rank offsets the imbalance caused by differing sub-dataset sizes.
     data_ids = data_ids[rank::world_size]
 
-    mp.set_start_method('fork', force=True)
-
     all_batch_indices = get_batch_indices(data_ids, batch_size)
     total_batches = len(all_batch_indices) # Total number of batches
 
+    if num_workers <= 0:
+        init_worker(dataset)
+        pbar = tqdm(
+            (worker_fn(indices) for indices in all_batch_indices),
+            total=total_batches,
+            unit="batch",
+            ncols=100,
+            disable=(rank != 0),
+            desc=f"rank{rank}",
+        )
+        for batch in pbar:
+            _update_stats_from_batch(batch, stats, state_norm_keys, acton_norm_keys, delta_norm, norm_merge_chunk_dim)
+        del dataset
+        return
+
+    mp.set_start_method('fork', force=True)
     # With the initializer each worker initializes the dataset only once, avoiding
     # passing it along with every task.
     with mp.Pool(processes=num_workers, initializer=init_worker, initargs=(dataset,)) as pool:
-        # imap_unordered returns results as soon as they are ready without preserving
-        # order, which is the most efficient. Only indices are passed now, not the
-        # whole dataset.
         results_generator = pool.imap_unordered(worker_fn, all_batch_indices)
 
         pbar = tqdm(
@@ -125,12 +157,7 @@ def compute_norm(dataset, batch_size, stats, state_norm_keys, acton_norm_keys, d
             desc=f"rank{rank}",
         )
         for batch in pbar:
-            for key in state_norm_keys:
-                values = np.asarray(batch[key])
-                stats[key].update(values.reshape(-1, values.shape[-1]))
-            for key in acton_norm_keys:
-                values = np.asarray(batch[key]) if (not delta_norm[key] or norm_merge_chunk_dim) else np.asarray(batch[key].reshape(batch[key].shape[0], -1))
-                stats[key].update(values.reshape(-1, values.shape[-1]))
+            _update_stats_from_batch(batch, stats, state_norm_keys, acton_norm_keys, delta_norm, norm_merge_chunk_dim)
 
     del pool
     del dataset
@@ -162,11 +189,12 @@ def _init_dataset_worker(
 if __name__ == "__main__":
 
     args = parse_args(Arguments)
+    if not args.data.norm_path:
+        raise ValueError("data.norm_path must be specified before computing normalization statistics.")
 
-    # Distributed initialization: reuse train.sh + torchrun; RANK/WORLD_SIZE/LOCAL_RANK are already injected via env vars
+    # Use CPU gloo backend so multiprocessing fork workers never inherit a CUDA/NCCL context.
     if args.train.world_size > 1 and not dist.is_initialized():
-        torch.cuda.set_device(f"cuda:{args.train.local_rank}")
-        dist.init_process_group(backend="nccl", timeout=timedelta(hours=2))
+        dist.init_process_group(backend="gloo", timeout=timedelta(hours=2))
     rank = args.train.global_rank
     world_size = args.train.world_size
 
@@ -192,28 +220,41 @@ if __name__ == "__main__":
         sampling_ratios = [1.0]
         args.data.data_name = 'multi'
 
-
-    filename = '_'.join(list(set(data_names)))
-    tmp_dir = "tmp/"
-    if rank == 0:
-        os.makedirs(tmp_dir, exist_ok=True)
-    if world_size > 1:
-        dist.barrier()
-    filename = os.path.join(tmp_dir, f"tmp_{filename}_rank{rank}.txt")
-    with open(filename, 'w') as f:
-        for robot, task, sampling_ratio in zip(data_names, repo_ids, sampling_ratios):
-            f.write(format_dataset_entry(robot, task, sampling_ratio) + "\n")
-    f.close()
-    args.data.train_path = filename
-    dataset = _init_dataset_worker(args, data_names)
+    tmp_filename = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            prefix=f"norm_datasets_rank{rank}_pid{os.getpid()}_",
+            suffix=".txt",
+            delete=False,
+            encoding="utf-8",
+        ) as f:
+            tmp_filename = f.name
+            for robot, task, sampling_ratio in zip(data_names, repo_ids, sampling_ratios):
+                f.write(format_dataset_entry(robot, task, sampling_ratio) + "\n")
+        args.data.train_path = tmp_filename
+        dataset = _init_dataset_worker(args, data_names)
+    finally:
+        if tmp_filename and os.path.exists(tmp_filename):
+            os.remove(tmp_filename)
     if rank == 0:
         print(f"===========\nProcessing {len(dataset._datasets)} lerobot datasets\n===========")
-    os.remove(filename)
-    assert len(list(set([' '.join(_datasets.state_features+_datasets.action_features) for _datasets in dataset._datasets])))==1
+    assert len(list(set([' '.join(_datasets.state_features+_datasets.action_features) for _datasets in dataset._datasets]))) == 1
+    first_sub = dataset._datasets[0].feature_transform.action_subtract_state
+    first_rel = dataset._datasets[0].feature_transform.action_relative_type
+    for sub_dataset in dataset._datasets[1:]:
+        if (
+            sub_dataset.feature_transform.action_subtract_state != first_sub
+            or sub_dataset.feature_transform.action_relative_type != first_rel
+        ):
+            raise ValueError(
+                "All datasets in a combined normalization run must share identical "
+                "action_subtract_state and action_relative_type settings."
+            )
 
     state_norm_keys = dataset._datasets[0].state_features
     acton_norm_keys = dataset._datasets[0].action_features
-    delta_norm = dataset._datasets[0].feature_transform.action_subtract_state
+    delta_norm = first_sub
     stats = {key: normalize.RunningStats() for key in acton_norm_keys+state_norm_keys}
     chunk_size = args.data.chunk_size
     

@@ -12,18 +12,18 @@ import numpy as np
 import torch
 import yaml
 from torch import Tensor
-from transformers import AutoConfig, AutoProcessor
+from transformers import AutoProcessor
 from transformers.initialization import no_init_weights
 
 from xense0vla.data.feature_transform import FeatureTransform
-from xense0vla.data.transforms import canonicalize_visual
+from xense0vla.data.transforms import canonicalize_visual, resize_rgb_uint8
 from xense0vla.models import (
+    cast_model_parameters_dtype,
     init_empty_weights,
 )
 from xense0vla.models import (
     load_model_weights as load_hf_model_weights,
 )
-from xense0vla.models.auto import build_image_processor
 from xense0vla.models.configuration_vla import VLAConfig
 from xense0vla.models.modeling_vla import VLAModel
 from xense0vla.utils.runtime_assets import (
@@ -33,18 +33,18 @@ from xense0vla.utils.runtime_assets import (
 )
 
 
-def set_seed_everywhere(seed: int):
+def set_seed_everywhere(seed: int, *, deterministic: bool = False):
     """Sets the random seed for Python, NumPy, and PyTorch functions."""
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
-VLM_BACKBONE_SUBDIR = "vlm_backbone"
 logger = logging.getLogger(__name__)
 
 
@@ -126,12 +126,6 @@ def _require_checkpoint_root_file(
 
 
 class PolicyPreprocessMixin:
-    @staticmethod
-    def _to_device_image_grid_thw(image_grid_thw, device):
-        if image_grid_thw is None:
-            return None
-        return image_grid_thw.to(device=device, dtype=torch.long)
-
     @torch.no_grad()
     def sample_actions_batch(
         self,
@@ -141,64 +135,39 @@ class PolicyPreprocessMixin:
         action_prefix: Tensor | None = None,
         prefix_lengths: Tensor | None = None,
     ) -> Tensor:
-        """Run one model forward for a batch of already-transformed observations.
-
-        Single-sample inference in ``select_action`` builds a leading batch
-        dimension just before calling ``sample_actions``. For Robocasa vector
-        envs we already collate that dimension in the websocket server, so this
-        method keeps the tensors batched and returns normalized action chunks
-        with shape ``(B, chunk, joint_max_dim)``.
-        """
-        self.eval()
-        device = "cuda"
+        """Sample normalized action chunks from a transformed observation or batch."""
+        device = next(self.parameters()).device
         dtype = torch.bfloat16 if use_bf16 else torch.float32
-        s1 = time.time()
-
-        images = observation["images"]
-        img_masks = observation["img_masks"]
-        lang_tokens = observation.get("lang_tokens")
-        lang_masks = observation.get("lang_masks")
-        state = observation["state"]
-        image_grid_thw = observation.get("image_grid_thw", None)
-
-        has_batch_dim = img_masks.ndim >= 2
-        if not has_batch_dim:
-            images = images.unsqueeze(0)
-            img_masks = img_masks.unsqueeze(0)
-        if lang_tokens is not None and lang_tokens.ndim == 1:
-            lang_tokens = lang_tokens.unsqueeze(0)
-            lang_masks = lang_masks.unsqueeze(0)
-        if state.ndim == 1:
-            state = state.unsqueeze(0)
+        s1 = time.perf_counter()
+        single = observation["wrist_images"].ndim == 4
+        inputs = {}
+        for key in ("wrist_images", "head_images", "image_grid_thw", "lang_tokens", "lang_masks"):
+            if key in observation:
+                value = observation[key]
+                if single:
+                    value = value.unsqueeze(0)
+                inputs[key] = value.to(device=device, dtype=dtype if value.is_floating_point() else value.dtype)
 
         if sample_actions_fn is None:
             raise ValueError("sample_actions_fn is required.")
-        model_images = images.to(device=device)
-        if model_images.is_floating_point():
-            model_images = model_images.to(dtype=dtype)
-
+        if action_prefix is not None:
+            if single and action_prefix.ndim == 2:
+                action_prefix = action_prefix.unsqueeze(0)
+            action_prefix = action_prefix.to(dtype=torch.float32, device=device)
+        if prefix_lengths is not None:
+            if single and prefix_lengths.ndim == 0:
+                prefix_lengths = prefix_lengths.unsqueeze(0)
+            prefix_lengths = prefix_lengths.to(dtype=torch.long, device=device)
         actions = sample_actions_fn(
-            images=model_images,
-            img_masks=img_masks.to(device=device),
-            lang_tokens=None if lang_tokens is None else lang_tokens.to(device=device),
-            lang_masks=None if lang_masks is None else lang_masks.to(device=device),
-            state=state.to(dtype=dtype, device=device),
-            image_grid_thw=self._to_device_image_grid_thw(image_grid_thw, device),
-            action_prefix=(
-                None
-                if action_prefix is None
-                else action_prefix.to(dtype=dtype, device=device)
-            ),
-            prefix_lengths=(
-                None
-                if prefix_lengths is None
-                else prefix_lengths.to(dtype=torch.long, device=device)
-            ),
+            **inputs,
+            action_prefix=action_prefix,
+            prefix_lengths=prefix_lengths,
         )
 
-        delta_time = time.time() - s1
-        logger.info("sample_actions batch=%s cost %.3f s", actions.shape[0], delta_time)
-        return actions.to(dtype=torch.float32, device="cpu")
+        actions_cpu = actions.to(dtype=torch.float32, device="cpu")
+        delta_time = time.perf_counter() - s1
+        logger.info("sample_actions batch=%s cost %.3f s", actions_cpu.shape[0], delta_time)
+        return actions_cpu
 
 class InferenceModel(PolicyPreprocessMixin, VLAModel):
     """Inference policy with feature normalization helpers."""
@@ -270,12 +239,6 @@ class RobotPolicy:
                 "Cannot publish a flat action_output_dim for the selected robot config."
             )
         rtc_enabled = bool(getattr(self.config, "rtc_training_enabled", False))
-        image_height, image_width = feature_transform.image_size
-        if image_height != image_width:
-            raise RuntimeError(
-                "Deployment client expects square RGB model inputs, got "
-                f"{feature_transform.image_size}."
-            )
         return {
             "protocol_version": 2 if rtc_enabled else 1,
             "policy_name": "action_policy" if self.config.standalone_action_policy else "vla",
@@ -283,8 +246,10 @@ class RobotPolicy:
             "use_length": int(self.use_length),
             "checkpoint_chunk_size": int(self.config.chunk_size),
             "action_output_dim": int(action_output_dim),
-            "vision_input_size": int(image_height),
-            "head_history_offset": int(self.config.head_history_offset),
+            "wrist_image_size": self.config.wrist_image_size,
+            "head_image_size": self.config.head_image_size if not self.config.standalone_action_policy else None,
+            "history_memory": self.config.history_memory if not self.config.standalone_action_policy else 0,
+            "history_stride": self.config.history_stride,
             "rtc_mode": (
                 "training_time_prefix_conditioned"
                 if rtc_enabled
@@ -299,26 +264,36 @@ class RobotPolicy:
         }
 
     def _prepare_model_for_inference(self) -> None:
-        meta_parameters = [name for name, value in self.vla.named_parameters() if value.is_meta]
-        if meta_parameters:
-            raise RuntimeError(
-                "Checkpoint loading left parameters on the meta device: "
-                f"{meta_parameters[:5]}."
-            )
-        non_cuda_parameters = [
+        meta_tensors = [
             name
-            for name, value in self.vla.named_parameters()
+            for name, value in (*self.vla.named_parameters(), *self.vla.named_buffers())
+            if value.is_meta
+        ]
+        if meta_tensors:
+            raise RuntimeError(
+                "Checkpoint loading left tensors on the meta device: "
+                f"{meta_tensors[:5]}."
+            )
+        non_cuda_tensors = [
+            name
+            for name, value in (*self.vla.named_parameters(), *self.vla.named_buffers())
             if value.device.type != "cuda"
         ]
-        if non_cuda_parameters:
+        if non_cuda_tensors:
             raise RuntimeError(
-                "Checkpoint loading left parameters outside CUDA: "
-                f"{non_cuda_parameters[:5]}."
+                "Checkpoint loading left tensors outside CUDA: "
+                f"{non_cuda_tensors[:5]}."
             )
         self.vla.eval()
         self.sample_actions_fn = self.vla.model.sample_actions
         if self.use_compile:
-            self.sample_actions_fn = torch.compile(self.vla.model.sample_actions)
+            # Compile the fixed-shape denoising step (action tokens + static KV
+            # tuple) instead of the full sample_actions wrapper, avoiding DA3 /
+            # GatedDeltaNet graph breaks.
+            self.vla.model.action_policy.denoise_step = torch.compile(
+                self.vla.model.action_policy.denoise_step,
+                mode="reduce-overhead",
+            )
 
     def load_vla(self, path_to_pi_model) -> VLAModel:
         checkpoint_dir = Path(path_to_pi_model).expanduser().resolve()
@@ -350,40 +325,11 @@ class RobotPolicy:
         if self.expected_standalone is not None and config.standalone_action_policy != self.expected_standalone:
             raise ValueError(f"{type(self).__name__} cannot load standalone_action_policy={config.standalone_action_policy!r}.")
 
-        if getattr(config, "vlm_family", None) != "qwen3_5":
-            raise ValueError(
-                "The composite checkpoint config is not a Qwen3.5 VLA config; "
-                f"got vlm_family={getattr(config, 'vlm_family', None)!r}."
-            )
-        backbone_subdir = getattr(config, "vlm_backbone_subdir", None)
-        if backbone_subdir != VLM_BACKBONE_SUBDIR:
-            raise ValueError(
-                "A standalone VLA checkpoint must declare "
-                f"vlm_backbone_subdir={VLM_BACKBONE_SUBDIR!r}, got "
-                f"{backbone_subdir!r}."
-            )
-        base_model_path = resolve_backbone_source(checkpoint_dir)
-        bundled_backbone_path = Path(base_model_path)
-
-        qwen_config = AutoConfig.from_pretrained(
-            base_model_path,
-            trust_remote_code=False,
-            local_files_only=True,
-        )
-        if getattr(qwen_config, "model_type", None) != "qwen3_5":
-            raise ValueError(
-                f"{base_model_path!r} has model_type={getattr(qwen_config, 'model_type', None)!r}; "
-                "VLA deployment requires Qwen3.5."
-            )
-        config.vlm_path = None
-        config.tokenizer_path = base_model_path
-
-        if config.standalone_action_policy:
-            self.processor = build_image_processor(str(bundled_backbone_path), local_files_only=True)
-        else:
+        self.processor = None
+        if not config.standalone_action_policy:
+            config.tokenizer_path = resolve_backbone_source(checkpoint_dir)
             self.processor = AutoProcessor.from_pretrained(
-                str(bundled_backbone_path), padding_side="right",
-                trust_remote_code=False, local_files_only=True,
+                config.tokenizer_path, padding_side="right", trust_remote_code=False, local_files_only=True
             )
         self.language_tokenizer = getattr(self.processor, "tokenizer", None)
         data_section = training_config.get("data")
@@ -416,10 +362,9 @@ class RobotPolicy:
         print(f"Initializing model directly on CUDA as {target_dtype} ...")
         with init_empty_weights(), no_init_weights():
             self.vla = InferenceModel(config, eval=True)
-        # Dtype-only conversion keeps parameters on meta. The loader then
-        # materializes each checkpoint tensor directly on CUDA in its final
-        # inference dtype, avoiding a full FP32 CPU model and a second transfer.
-        self.vla = self.vla.to(dtype=target_dtype)
+        # Parameter-only dtype conversion keeps parameters on meta while
+        # preserving non-persistent FP32 RoPE buffers (Qwen3.5 inv_freq, etc.).
+        cast_model_parameters_dtype(self.vla, target_dtype)
         load_hf_model_weights(
             self.vla,
             str(checkpoint_dir),
@@ -474,7 +419,6 @@ class RobotPolicy:
                 f"Robot config does not exist: {str(robot_config_path)!r}."
             )
 
-        image_size = getattr(self.data_config, 'img_size', 256)
         feature_transform = FeatureTransform(
             str(robot_config_path),
             self.data_config,
@@ -482,43 +426,43 @@ class RobotPolicy:
             self.processor,
             chunk_size=self.config.chunk_size,
             norm_stats_path=self.norm_stats_path,
-            image_size=(image_size, image_size),
         )
         # Load data processors
         self.vla.feature_transform = feature_transform
         self.action_key = feature_transform.org_features["actions"]
 
-    def _update_head_histories(self, observations):
-        """Accept explicit [t-offset, t] pairs, or keep a control-tick history.
-
-        Chunk clients that skip observations must send the explicit pair so
-        the offset remains measured in camera/control frames, not requests.
-        Episode warmup repeats the earliest available frame.
-        """
+    def _update_head_histories(self, observations, *, build_clips: bool = True):
+        """Use explicit chronological clips, or sample a per-control-tick buffer."""
         if self.config.standalone_action_policy:
             return observations
-        offset = int(self.config.head_history_offset)
+        transform = self.vla.feature_transform
+        offsets = transform.head_offsets
+        keys = transform.org_head_model_images
         if len(self._head_histories) != len(observations):
-            self._head_histories = [deque(maxlen=offset + 1) for _ in observations]
-        source_key = self.vla.feature_transform.org_model_images[0]
+            self._head_histories = [
+                {key: deque(maxlen=1 - offsets[0]) for key in keys} for _ in observations
+            ]
         prepared = []
-        for raw, history in zip(observations, self._head_histories):
-            observation = dict(raw)
-            if source_key not in observation:
-                raise KeyError(f"Missing head camera {source_key!r}.")
-            visual = canonicalize_visual(observation[source_key])
-            if visual.ndim == 4:
-                if visual.shape[0] != 2:
-                    raise ValueError("Head camera clips must contain [history, current] frames.")
-                observation[source_key] = visual
-                history.append(visual[-1].clone())
-            elif visual.ndim == 3:
-                history.append(visual.clone())
-                observation[source_key] = torch.stack([history[0], history[-1]])
-            else:
-                raise ValueError("Head camera must be CHW/HWC or a two-frame clip.")
-            prepared.append(observation)
-        return prepared
+        for raw, histories in zip(observations, self._head_histories):
+            observation = dict(raw) if build_clips else None
+            for key in keys:
+                visual = canonicalize_visual(raw[key])
+                history = histories[key]
+                if visual.ndim == 4 and visual.shape[0] != len(offsets):
+                    raise ValueError(f"Expected {len(offsets)} head frames for {key!r}, got {visual.shape[0]}.")
+                # A single-source head can be stored at model resolution. Composite
+                # heads must retain native coordinates until FeatureTransform joins them.
+                if len(keys) == 1:
+                    visual = resize_rgb_uint8(visual, self.config.head_image_size)
+                history.append((visual[-1] if visual.ndim == 4 else visual).clone())
+                if build_clips:
+                    if visual.ndim == 3:
+                        last = len(history) - 1
+                        visual = torch.stack([history[max(0, last + offset)] for offset in offsets])
+                    observation[key] = visual
+            if build_clips:
+                prepared.append(observation)
+        return prepared if build_clips else observations
 
     def _unapply_batched_actions(self, transformed_observations, actions):
         action_chunk = {}
@@ -528,8 +472,6 @@ class RobotPolicy:
         for transformed, action in zip(transformed_observations, actions):
             single = dict(transformed)
             single['actions'] = action.to(dtype=torch.float32, device='cpu')
-            if self.use_bf16 and 'state' in single:
-                single['state'] = single['state'].to(dtype=torch.float32)
             data = self.vla.feature_transform.unapply(single)
 
             for action in self.action_key:
@@ -552,10 +494,7 @@ class RobotPolicy:
         for k, v in list(observation.items()):
             if isinstance(v, np.ndarray):
                 observation[k] = torch.from_numpy(v)
-        observation =  self.vla.feature_transform.apply(observation, policy_eval=True)
-        if self.use_bf16:
-            observation['state'] = observation['state'].to(torch.bfloat16)
-        return observation
+        return self.vla.feature_transform.apply(observation, policy_eval=True)
 
     def _prepare_rtc_prefix_batch(self, observations):
         """Validate wire prefixes and map them into normalized model space."""
@@ -606,6 +545,11 @@ class RobotPolicy:
                     raise ValueError(
                         "rtc_prefix_length must stay within the checkpoint's trained "
                         f"range [1, {self.config.rtc_max_delay_steps}], got {prefix_length}."
+                    )
+                if prefix_length >= self.use_length:
+                    raise ValueError(
+                        f"rtc_prefix_length ({prefix_length}) must be strictly smaller than "
+                        f"use_length ({self.use_length}) so new postfix actions are returned."
                     )
                 if not np.issubdtype(raw_prefix.dtype, np.number) or not np.isfinite(
                     raw_prefix
@@ -716,7 +660,8 @@ class RobotPolicy:
 
     def infer(self, observation, return_normalized=False):
         """Generates an action with the VLA policy."""
-        if 'reset' in observation and observation['reset']:
+        reset_flag = observation.get("reset") if isinstance(observation, Mapping) else None
+        if isinstance(reset_flag, (bool, np.bool_)) and bool(reset_flag):
             if "path_to_pi_model" in observation:
                 raise ValueError("Remote model reload is disabled; restart the server with --model_path.")
             if "robo_name" not in observation:
@@ -727,8 +672,15 @@ class RobotPolicy:
         is_batch = 'batch' in observation
         observations = observation['batch'] if is_batch else [observation]
         batch_size = len(observations)
-        # Record every control tick, including ticks served from an action chunk.
-        observations = self._update_head_histories(observations)
+        has_rtc_prefix = any(
+            isinstance(obs, Mapping)
+            and (obs.get("rtc_action_prefix") is not None or obs.get("rtc_prefix_length") is not None)
+            for obs in observations
+        )
+        if has_rtc_prefix and not self.chunk_ret:
+            raise ValueError(
+                "RTC prefix-conditioned requests require chunk_ret=True; single-step cached mode is unsupported."
+            )
         should_forward = (
             self.chunk_ret
             or self.last_action_chunk is None
@@ -736,6 +688,9 @@ class RobotPolicy:
             or (return_normalized and self.last_normalized_action_chunk is None)
             or self._chunk_step >= self.use_length
         )
+        # Record every control tick, including ticks served from an action chunk,
+        # but skip stacking full clips on ticks that will reuse the cached chunk.
+        observations = self._update_head_histories(observations, build_clips=should_forward)
 
         if should_forward:
             if return_normalized:
@@ -757,7 +712,8 @@ class RobotPolicy:
             self._chunk_step = 0
 
         if self.chunk_ret:
-            action = self.last_action_chunk               # (B, chunk, dim)
+            # Copy dict so non-batch slicing or caller metadata never mutates the cache.
+            action = dict(self.last_action_chunk)         # (B, chunk, dim)
             normalized_action = self.last_normalized_action_chunk
         else:
             step_idx = self._chunk_step

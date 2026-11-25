@@ -4,17 +4,17 @@
 
 ## 1. 独立 Action Policy 预训练
 
-只使用左右腕部图像和 state，不构建语言 backbone，也不读取任务或子任务。腕部图像经过 Qwen 视觉编码器，默认冻结视觉编码器，只训练 action policy。
+独立策略以 `spatial_encoder` 从双腕当前帧提取的空间 token 为条件。预训练时，用 DA3-LARGE 权重初始化其中的 Transformer 主干，并以 `train.spatial_encoder_lr` 微调。编码器中的下采样卷积、通道投影以及动作网络其余参数均从头训练，使用 `train.lr`。
 
 ```bash
 bash train.sh tasks/train_action_policy.py configs/policy_action/pretrain.yaml
 ```
 
-当前 `pretrain.yaml` 使用多数据集清单和合并统计；准备方式见 [多数据集训练](data.md#多数据集训练)。单数据集训练可直接修改同一份配置的 `data` 字段。
+当前 `pretrain.yaml` 使用多数据集清单和合并统计；准备方式见 [数据清单与采样](data.md#数据清单与采样)。单数据集训练可直接修改同一份配置的 `data` 字段。
 
 需要修改的主要字段：
 
-- `model.vlm_path`：Qwen3.5-2B 目录。
+- `model.spatial_encoder_path` 指向用于初始化 Transformer 主干的 DA3-LARGE checkpoint。
 - `data.train_path`、`data.norm_stats_file`：数据及归一化统计。
 - `train.output_dir`、`train.max_steps`：保存目录与训练步数。
 
@@ -22,14 +22,14 @@ bash train.sh tasks/train_action_policy.py configs/policy_action/pretrain.yaml
 
 ## 2. 独立 Action Policy 后训练
 
-加载 Qwen 视觉配置与独立策略迁移包，默认冻结视觉编码器并开启 RTC。
+加载预训练导出的完整动作策略，使用一个学习率更新所有参数，默认开启 RTC。
 
 ```bash
 bash train.sh tasks/train_action_policy.py configs/policy_action/post_train.yaml \
   --model.action_policy_path outputs/action_pretrain/checkpoints/global_step_50000/hf_ckpt/action_policy
 ```
 
-迁移包必须包含动作网络和 `vision_encoder/`。两部分权重都会恢复，确保继续使用预训练时的视觉特征。
+动作包包含训练后的完整 `spatial_encoder`、18 个动作层及动作网络的输入输出投影，可以直接部署。
 
 ## 3. 完整 VLA 预训练：mid_train
 
@@ -40,7 +40,7 @@ bash train.sh tasks/train_vla.py configs/policy_vla/mid_train.yaml \
   --model.action_policy_path outputs/action_pretrain/checkpoints/global_step_50000/hf_ckpt/action_policy
 ```
 
-当前 `mid_train.yaml` 的 `data_name` 为 `multi`，使用 `assets/data_path/multi_pretrain_datasets.txt` 和对应合并统计。单数据集训练时，按 [数据指南](data.md#配置数据路径) 修改 `data` 字段。
+当前 `mid_train.yaml` 的 `data_name` 为 `multi`，使用 `assets/data_path/multi_pretrain_datasets.txt` 和对应合并统计。单数据集训练时，按 [数据配置](data.md#数据配置) 修改 `data` 字段。
 
 **mid_train 默认开启子任务语言 loss**。训练数据需有子任务标注；若只训练动作，可显式关闭：
 
@@ -49,7 +49,7 @@ bash train.sh tasks/train_vla.py configs/policy_vla/mid_train.yaml \
   --train.use_subtask_loss false
 ```
 
-默认冻结视觉编码器。`train.vlm_lr` 控制语言模型及解冻后的视觉编码器，`train.action_policy_lr` 控制动作网络。
+`mid_train.yaml` 默认冻结预训练动作策略的大部分参数（`train.freeze_action_policy: true`），但开启 `train.unfreeze_mot_layers: true`，让动作侧接收 Qwen KV 的 6 个 MoT 耦合层（第 3、6、9、12、15、18 个完整 block）保持可训练并使用 `train.lr`；Qwen 语言模型与头部视觉塔共用 `train.vlm_lr`。如需完全冻结全部动作层，可显式传 `--train.unfreeze_mot_layers false`。
 
 ## 4. 完整 VLA 后训练
 
@@ -66,14 +66,14 @@ bash train.sh tasks/train_vla.py configs/policy_vla/post_train.yaml \
 
 | 需求 | 配置 |
 | --- | --- |
-| 解冻视觉编码器 | 所有训练配置都可设 `train.freeze_vision_encoder: false` |
-| 调整模块学习率 | `train.action_policy_lr`；完整 VLA 另有 `train.vlm_lr` |
+| 只解冻接收 MoT KV 的动作层 | VLA 设置 `train.freeze_action_policy: true` 和 `train.unfreeze_mot_layers: true` |
+| 调整模块学习率 | 独立预训练用 `train.spatial_encoder_lr`，完整 VLA 用 `train.vlm_lr` |
 | 增加有效 batch | 增加 `train.gradient_accumulation_steps` |
 | 减少显存占用 | 先减小 `train.micro_batch_size`，保留梯度检查点 |
-| 调整头部历史 | 完整 VLA 的 `train.head_history_offset`，单位为数据帧 |
-| 多数据集训练 | 在对应阶段配置中设置 `data_name: multi`、数据集清单和合并统计，见 [数据指南](data.md#多数据集训练) |
+| 调整头部历史 | `train.history_memory` 设历史张数，`train.history_stride` 设间隔帧数 |
+| 多数据集训练 | 在对应阶段配置中设置 `data_name: multi`、数据集清单和合并统计，见 [数据清单与采样](data.md#数据清单与采样) |
 
-模块学习率未设置时使用 `train.lr`。独立策略解冻后的视觉编码器也使用 `train.lr`。
+预训练样例使用 `1e-5` 微调 `spatial_encoder` 的 Transformer 主干，使用 `1e-4` 训练其余参数。独立后训练样例统一使用 `1e-5`。
 
 默认训练使用 FP32 参数与 AdamW 状态、BF16 autocast。`train.parameter_dtype: bfloat16` 可进一步减少显存，但会改变参数和优化器状态的精度。部署权重统一导出为 BF16。
 
@@ -104,7 +104,7 @@ rtc_training:
 | --- | --- |
 | DCP 训练状态 | 恢复模型、优化器、调度器、随机数和 DataLoader 进度 |
 | `hf_ckpt/` | 完整部署包，可整体复制 |
-| `hf_ckpt/action_policy/` | 独立训练导出的迁移包，用于独立后训练和 mid_train |
+| `hf_ckpt/action_policy/` | 独立策略训练时导出的完整动作包，可单独部署，也可用于动作后训练和 VLA mid_train 初始化 |
 
 在同一输出目录断点续训：
 
@@ -113,18 +113,17 @@ bash train.sh tasks/train_vla.py configs/policy_vla/mid_train.yaml \
   --train.enable_resume true
 ```
 
-也可用 `train.load_checkpoint_path` 指定 DCP checkpoint。若刻意更换数据或采样顺序，设置 `train.resume_dataloader_state: false`。后训练的权重初始化会创建新的优化器，与断点续训用途不同。
+也可用 `train.load_checkpoint_path` 指定 DCP checkpoint。续训从本次训练保存的模型配置和 DCP 恢复权重，原始 DA3 和 Qwen 权重目录可以移走。若更换数据或采样顺序，可设置 `train.resume_dataloader_state: false`。从部署包开始后训练时，训练器会创建新的优化器。
 
 ## 验证训练入口
 
 运行回归测试：
 
 ```bash
-python -m pip install pytest
-python -m pytest tests -q
+python -m unittest discover -s tests -v
 ```
 
-用真实 Qwen3.5-2B 和示例数据执行四种训练流程，每种做一步优化、导出和重载推理：
+以下命令使用 DA3-LARGE 和 Qwen3.5-2B 的预训练权重与示例数据，依次验证四种训练流程的单步优化、导出和重载推理。
 
 ```bash
 python scripts/test_training_entries_gpu.py \

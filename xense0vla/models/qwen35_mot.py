@@ -23,7 +23,15 @@ def qwen35_layer_type(layer):
     return value
 
 
-def _mot_decoder_forward(self, hidden_states, position_embeddings=None, *, mot_mode=None, **kwargs):
+def _mot_decoder_forward(
+    self,
+    hidden_states,
+    position_embeddings=None,
+    mot_gate=None,
+    *,
+    mot_mode=None,
+    **kwargs,
+):
     if mot_mode is None:
         return type(self)._vla_original_forward(
             self, hidden_states, position_embeddings=position_embeddings, **kwargs
@@ -48,8 +56,18 @@ def _mot_decoder_forward(self, hidden_states, position_embeddings=None, *, mot_m
         key = self.self_attn.k_norm(self.self_attn.k_proj(normalized).view(*shape, -1, dim)).transpose(1, 2)
         value = self.self_attn.v_proj(normalized).view(*shape, -1, dim).transpose(1, 2)
         return query, key, value, gate.reshape(*shape, -1)
+    if mot_mode == "project_kv":
+        normalized = self.input_layernorm(hidden_states)
+        shape = normalized.shape[:-1]
+        dim = self.self_attn.head_dim
+        key = self.self_attn.k_norm(self.self_attn.k_proj(normalized).view(*shape, -1, dim)).transpose(1, 2)
+        value = self.self_attn.v_proj(normalized).view(*shape, -1, dim).transpose(1, 2)
+        return key, value
     if mot_mode == "finish":
-        attention, gate = position_embeddings
+        if mot_gate is None:
+            attention, gate = position_embeddings
+        else:
+            attention, gate = position_embeddings, mot_gate
         hidden_states = hidden_states + self.self_attn.o_proj(attention * torch.sigmoid(gate))
         return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
     raise ValueError(f"Unknown MoT operation {mot_mode!r}.")

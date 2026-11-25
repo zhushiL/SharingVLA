@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 from typing import Any, Sequence
@@ -50,12 +49,19 @@ def export_hf_checkpoint(
     try:
         # ckpt_to_state_dict reads checkpoint_path/model only. Optimizer,
         # scheduler, RNG and dataloader state never enter the HF artifact.
-        state_dict = ckpt_to_state_dict(checkpoint_path=checkpoint_path)
-        # Convert only the deployment copy, never the live model or DCP state.
-        state_dict = {
-            name: tensor.detach().to(device="cpu", dtype=torch.bfloat16) if tensor.is_floating_point() else tensor
-            for name, tensor in state_dict.items()
-        }
+        raw_state_dict = ckpt_to_state_dict(checkpoint_path=checkpoint_path)
+        # Convert tensors in place by popping from raw_state_dict so FP32 and
+        # BF16 copies are never simultaneously resident in rank-0 CPU RAM.
+        state_dict = {}
+        for name in list(raw_state_dict.keys()):
+            tensor = raw_state_dict.pop(name)
+            state_dict[name] = (
+                tensor.detach().to(device="cpu", dtype=torch.bfloat16)
+                if tensor.is_floating_point()
+                else tensor.detach().cpu()
+            )
+            del tensor
+        del raw_state_dict
         save_model_weights(
             tmp_dir,
             state_dict,
@@ -68,27 +74,17 @@ def export_hf_checkpoint(
             None,
         )
         if config is not None and config.standalone_action_policy:
-            # Export the complete trainable policy separately so mid_train and
-            # action_posttrain never need to initialize a language backbone.
-            prefix = "model.action_policy."
-            action_state = {
-                name[len(prefix) :]: tensor for name, tensor in state_dict.items() if name.startswith(prefix)
-            }
-            if not action_state:
-                raise ValueError("Standalone checkpoint contains no action policy parameters.")
+            # Publish the transferable subdirectory with identical standalone keys and assets.
+            # Hard links keep one payload on disk while both paths can be moved independently.
             action_dir = os.path.join(tmp_dir, "action_policy")
-            save_model_weights(action_dir, action_state, save_dtype=None)
-            vision_prefix = "model.backbone.visual."
-            vision_state = {
-                name[len(vision_prefix) :]: tensor
-                for name, tensor in state_dict.items()
-                if name.startswith(vision_prefix)
-            }
-            if not vision_state:
-                raise ValueError("Standalone checkpoint contains no Qwen vision parameters.")
-            save_model_weights(os.path.join(action_dir, "vision_encoder"), vision_state, save_dtype=None)
-            with open(os.path.join(action_dir, "config.json"), "w", encoding="utf-8") as handle:
-                json.dump(config.to_dict(), handle, indent=2)
+            def link_or_copy(source, destination):
+                try:
+                    os.link(source, destination)
+                except OSError:
+                    shutil.copy2(source, destination)
+
+            shutil.copytree(tmp_dir, action_dir, copy_function=link_or_copy,
+                            ignore=shutil.ignore_patterns("action_policy"))
 
         # Keep the previous complete artifact recoverable until the new staging
         # directory has been published successfully.

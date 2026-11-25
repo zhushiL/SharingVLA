@@ -1,4 +1,4 @@
-"""Independent wrist/state robot controller."""
+"""Independent dual-wrist robot controller."""
 
 from .policy import RobotPolicy
 

@@ -32,3 +32,6 @@ dist/
 /wandb/
 /outputs/
 /pretrained_models/
+/open_loop_test/
+/data/
+/trace/

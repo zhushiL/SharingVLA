@@ -45,9 +45,12 @@ def _get_task_name(tasks, task_idx):
 
 
 def _resolve_lerobot_location(repo_id):
-    repo_path = Path(repo_id).expanduser()
+    repo_str = str(repo_id)
+    repo_path = Path(repo_str).expanduser()
     if repo_path.exists():
         return repo_path.name, repo_path
+    if repo_str.startswith(("/", "./", "../", "~")) or os.sep in repo_str and Path(repo_str).anchor:
+        raise FileNotFoundError(f"Local LeRobot dataset path does not exist: {repo_id!r}.")
     return repo_id, None
 
 
@@ -65,9 +68,12 @@ class LeRobotDataset(BaseLeRobotDataset):
         self.load_image = load_image
         self.load_task = load_task
         self.load_subtask = load_subtask
-        self.selected_camera_keys = set(
-            camera_keys if camera_keys is not None else (key for key in self.meta.camera_keys if "tactile" not in key)
-        )
+        if not load_image:
+            self.selected_camera_keys = set()
+        else:
+            self.selected_camera_keys = set(
+                camera_keys if camera_keys is not None else (key for key in self.meta.camera_keys if "tactile" not in key)
+            )
         if any("tactile" in key for key in self.selected_camera_keys):
             raise ValueError("Tactile cameras are not supported by this policy.")
         # Embedded image columns are lazy Arrow columns; dropping unused cameras
@@ -76,26 +82,24 @@ class LeRobotDataset(BaseLeRobotDataset):
         columns = getattr(self.hf_dataset, "column_names", [])
         if excluded.intersection(columns):
             self.hf_dataset = self.hf_dataset.select_columns([key for key in columns if key not in excluded])
+        self._column_views: dict = {}
 
     def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
         """
-        Query dataset for indices across keys, skipping video keys.
-
-        Tries column-first [key][indices] for speed, falls back to row-first.
-
-        Args:
-            query_indices: Dict mapping keys to index lists to retrieve
-
-        Returns:
-            Dict with stacked tensors of queried data (video keys excluded)
+        Query dataset for indices across keys using cached single-column views,
+        avoiding row-first full-column decoding of embedded image columns.
         """
         result: dict = {}
         for key, q_idx in query_indices.items():
             if key in self.meta.video_keys:
                 continue
-            # Map absolute indices to relative indices if needed
             relative_indices = _to_relative_indices(self, q_idx)
-            result[key] = torch.stack(self.hf_dataset[relative_indices][key])
+            column_view = self._column_views.get(key)
+            if column_view is None and hasattr(self.hf_dataset, "select_columns"):
+                column_view = self.hf_dataset.select_columns([key])
+                self._column_views[key] = column_view
+            source = column_view if column_view is not None else self.hf_dataset
+            result[key] = torch.stack(source[relative_indices][key])
         return result
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
@@ -176,7 +180,6 @@ class VLADataset(Dataset):
         processor=None,
         video_backend="torchcodec",
         chunk_size=20,
-        image_size=(224, 224),
         do_nomalize=True,
         return_item=False,
         disabled_image_features=False,
@@ -194,7 +197,7 @@ class VLADataset(Dataset):
         self.data_name = data_name
         self.disabled_image_features = disabled_image_features
         self.return_raw_images = return_raw_images
-        load_image = True if do_nomalize else False
+        load_image = not disabled_image_features
 
         if feature_transform is None:
             robot_config = os.path.join(robot_config_root, f"{data_name}.yaml")
@@ -212,7 +215,6 @@ class VLADataset(Dataset):
                 image_augment=image_augment,
                 return_raw_images=return_raw_images,
                 norm_stats_path=norm_stats_path,
-                image_size=image_size,
             )
         else:
             self.feature_transform = feature_transform
@@ -246,8 +248,8 @@ class VLADataset(Dataset):
             image_transforms=None,
             delta_timestamps=merged_delta,
             video_backend=video_backend,
-            load_image=load_image and not disabled_image_features,
-            camera_keys=self.feature_transform.org_model_images,
+            load_image=load_image,
+            camera_keys=self.feature_transform.org_model_images if load_image else [],
             load_task=not self.feature_transform.action_only,
             load_subtask=load_subtask,
         )
@@ -289,13 +291,13 @@ class VLADataset(Dataset):
         return delta_timestamps
 
     def get_video_delta_timestamps(self):
-        """Sample the head at [t-offset, t], clamped by LeRobot within the episode."""
+        """Sample chronological head frames, clamped by LeRobot within the episode."""
         if self.disabled_image_features or self.feature_transform.action_only:
             return {}
         fps = float(self.dataset_meta.fps)
         if fps <= 0:
             raise ValueError(f"Temporal head-camera sampling requires positive FPS, got {fps}.")
-        offsets = [-self.feature_transform.head_history_offset / fps, 0.0]
+        offsets = [offset / fps for offset in self.feature_transform.head_offsets]
         return dict.fromkeys(self.feature_transform.org_head_model_images, offsets)
 
     def check_lerobot_item(self, item):

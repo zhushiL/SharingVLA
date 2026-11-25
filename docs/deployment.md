@@ -11,13 +11,13 @@ hf_ckpt/
   config.json
   model*.safetensors
   vla_cli.yaml
-  vlm_backbone/
+  vlm_backbone/       # 仅完整 VLA
   runtime_assets/
     norm_stats.json
     robot_configs/own_robot.yaml
 ```
 
-独立训练还会导出 `hf_ckpt/action_policy/`，它用于训练迁移，不能作为服务的 `model_path`。服务使用本版本导出的配置与资源，不自动转换其他格式。
+独立训练还会导出可单独复制的 `hf_ckpt/action_policy/`，可作为服务的 `model_path`，也可用于后续训练。服务使用本版本导出的配置与资源，不自动转换其他格式。
 
 ## 启动服务
 
@@ -37,7 +37,7 @@ python -m deploy.serve_policy --policy vla --port 8007 \
 
 将步数和目录替换为实际训练输出。后训练模型也使用同一入口。默认端口为 8006，返回完整动作 chunk；多数据集模型需额外指定 `--robot_name own_robot`。
 
-只允许本机连接时加 `--host 127.0.0.1`。每个服务实例支持一个活动客户端；健康检查地址为 `http://127.0.0.1:8006/healthz`。
+默认仅监听本机 `127.0.0.1`；需要在局域网对外提供服务时请显式传 `--host 0.0.0.0`（建议同时设置 `--api-key` 或环境变量 `POLICY_API_KEY`）。每个服务实例支持一个活动客户端；健康检查地址为 `http://127.0.0.1:8006/healthz`。
 
 ## 准备观测
 
@@ -45,15 +45,15 @@ python -m deploy.serve_policy --policy vla --port 8007 \
 
 | 字段 | 格式 | 策略 |
 | --- | --- | --- |
-| `observation.images.left_left_wrist` | RGB `uint8 [H,W,3]` 或 `[3,H,W]` | 两种 |
-| `observation.images.right_right_wrist` | 同上 | 两种 |
+| `observation.images.left_wrist` | RGB `uint8 [H,W,3]` 或 `[3,H,W]` | 两种 |
+| `observation.images.right_wrist` | 同上 | 两种 |
 | `observation.state` | `float32 [20]` | 两种 |
-| `observation.images.head` | 两帧 RGB，`uint8 [2,H,W,3]` 或 `[2,3,H,W]` | 仅 VLA |
+| `observation.images.head` | 按时间排序的 RGB，`uint8 [T,H,W,3]` 或 `[T,3,H,W]`，T 为历史张数加一 | 仅 VLA |
 | `task` | 全局任务字符串 | 仅 VLA |
 
 state 顺序为左 TCP 9 维、左夹爪 1 维、右 TCP 9 维、右夹爪 1 维。TCP 为 xyz + 6D rotation，单位与坐标系必须和训练一致。OpenCV 采集的 BGR 图像需先转为 RGB。
 
-VLA 的两帧头部图像依次为历史帧、当前帧。历史间隔使用 checkpoint 的 `head_history_offset`，默认 30 个数据帧；缓冲区不足时使用最早帧。建议客户端按相机帧维护缓冲区并显式发送两帧。仅发送当前帧时，服务按请求次数维护历史，无法保证与训练的帧间隔一致。
+默认 `history_memory=3`、`history_stride=30`，VLA 按 t−90、t−60、t−30、t 读取四帧。episode 开头用首帧补齐。若每个控制步均调用服务，客户端可只发当前帧，服务维护缓冲区。按 chunk 跳步调用时，客户端应按控制步采集并显式发送完整帧序列。
 
 ## 客户端示例
 
@@ -80,8 +80,8 @@ def predict_chunk(observation, port=8006):
 import numpy as np
 
 observation = {
-    "observation.images.left_left_wrist": np.asarray(left_rgb, dtype=np.uint8),
-    "observation.images.right_right_wrist": np.asarray(right_rgb, dtype=np.uint8),
+    "observation.images.left_wrist": np.asarray(left_rgb, dtype=np.uint8),
+    "observation.images.right_wrist": np.asarray(right_rgb, dtype=np.uint8),
     "observation.state": np.asarray(state, dtype=np.float32),
 }
 ```
@@ -89,7 +89,7 @@ observation = {
 完整 VLA 另外加入头部图像与任务文本，连接上例的 8007 端口：
 
 ```python
-observation["observation.images.head"] = np.stack([head_history, head_current]).astype(np.uint8)
+observation["observation.images.head"] = np.stack([head_t_minus_90, head_t_minus_60, head_t_minus_30, head_current]).astype(np.uint8)
 observation["task"] = "将物体放入容器"
 ```
 
@@ -162,9 +162,9 @@ python -m deploy.serve_console
 - 页面：`http://127.0.0.1:8080`。
 - 机器人连接：`ws://<server局域网IP>:8006`，**仅在模型加载成功后开放**。
 - 页面右上角显示本机局域网 IP，展开后列出各网卡的网页和 client 地址，支持复制。
-- 默认绑定 `0.0.0.0`，用于可信局域网。只在本机访问时加 `--host 127.0.0.1`。
+- 默认监听 `127.0.0.1`（仅本机访问）。需要局域网访问时请显式加 `--host 0.0.0.0`（建议同时传 `--api-key` 保护推理端口）。
 - 可用 `--web-port 8080 --port 8006 --preview-fps 5` 调整端口和预览编码频率。
-- 默认可浏览和加载服务器本机任意有权限读取的目录（含隐藏目录）。`--checkpoint-root` 可重复指定选择器的快捷目录，省略时从当前工作目录开始。若需要限定范围，可加 `--restrict-checkpoints`，此时仅允许这些根目录内的路径。
+- 默认开启 `--restrict-checkpoints`，仅允许浏览和加载 `--checkpoint-root` 指定的根目录内权重（省略时默认当前工作目录）。如需允许选择服务器任意可读目录，请显式传 `--no-restrict-checkpoints`。
 
 权重位于其他目录时，直接在页面选择或输入绝对路径即可，无需修改启动命令。若希望添加常用目录快捷入口，可选用：
 
@@ -177,7 +177,7 @@ python -m deploy.serve_console \
 页面依次操作：
 
 1. 在服务器桌面通过 `http://127.0.0.1:8080` 访问时，点击文件夹图标打开系统目录选择器，选好后自动检查权重（Linux 需已安装 `zenity` 且服务能访问桌面会话）。远程访问、无桌面或选择器不可用时自动使用网页目录选择；也可点击“路径选择”或直接输入绝对路径（支持 `~`）。选择完整 `hf_ckpt`，不会上传权重文件。
-2. 检查配置。页面自动识别 Action Policy / VLA、可选机器人、chunk 大小和 RTC 训练能力。不能选择 `hf_ckpt/action_policy` 训练迁移包。
+2. 检查配置。页面自动识别 Action Policy / VLA、可选机器人、chunk 大小和 RTC 训练能力。独立策略也可以选择 `hf_ckpt/action_policy/`。
 3. 选择机器人、BF16/FP32，按需开启 `torch.compile`，点击加载。首个真实请求可能触发编译，首次推理延迟不代表稳定运行延迟。
 4. VLA 在页面填写并应用 task；Action Policy 不读取文本，页面禁用任务编辑。Task 默认显示“待应用”“等待下一轮推理”等状态；展开“版本详情”可查看提交、推理和返回版本。“新任务已用于推理”仅确认生成动作块所用的任务，不代表机器人已执行完成。
 5. Client 连接并调用 `reset(metadata["robot_name"])`，随后连续发送观测。页面中间横排显示三路图像，最左侧显示 TCP XYZ 及最近 100 次预览采样的小曲线，最右侧为模型设置，任务编辑位于实时观测下方的中间主栏。头部当前/历史帧用下拉框切换。
@@ -187,7 +187,7 @@ python -m deploy.serve_console \
 
 ### 统一观测与任务来源
 
-两种 policy 可以接收同样的完整观测：头部历史/当前两帧、左右腕部 RGB、state，以及可选 RTC 前缀。**以页面/metadata 中的 `observation_schema` 为准使用相机与 state 的原生字段名**，不要从其他权重包复制字段名。模型继续使用 checkpoint 的预处理；Action Policy 只消费其腕部图像和 state，额外头部帧仍可用于页面展示。
+两种 policy 可以接收同样的完整观测：头部历史与当前帧、左右腕部 RGB、state，以及可选 RTC 前缀。**以页面/metadata 中的 `observation_schema` 为准使用相机与 state 的原生字段名**，不要从其他权重包复制字段名。模型继续使用 checkpoint 的预处理；独立策略网络只消费双腕图像，动作坐标转换可使用 state，额外头部帧仍可用于页面展示。
 
 在控制台模式下 `metadata["task_source"] == "server"`，client 的 `task` 被忽略。VLA 每次推理开始时固定任务文本及版本，页面更新 task 只影响下一次开始的推理，**不 reset、不重载模型、不清除头部历史**。正在计算的旧任务响应正常返回，用其版本识别即可；不要因页面更新就无条件清空 RTC 队列或丢掉在途结果。
 
@@ -232,33 +232,15 @@ finally:
 
 RTC 的已承诺前缀在切换任务时保持，新的 task 条件化生成后续动作。Client 仍负责控制时钟、动作队列、延迟估计、结果过期处理及超时保持；本控制台不会驱动机器人。若请求等待期间控制器执行超过有效覆盖范围，不能重放过期动作，需要控制器按自己的策略重新请求或保持。建议每次只保留一个在途请求，避免排队使观测和 RTC 前缀过期。
 
-页面显示的是 **模型收到的观测**，不是独立相机视频流。图片和 state 带同一个观测序号；页面仅按 checkpoint 中的 TCP 映射展示 XYZ，模型仍使用完整 state；超过 2 秒未刷新标记过期。已提交、当前推理、最近返回任务版本分开显示，它们不等同于实际已执行版本；当前 client 没有回传执行确认。
+页面显示的是 **模型收到的观测**，不是独立相机视频流。图片和 state 带同一个观测序号；页面仅按 checkpoint 中的 TCP 映射展示 XYZ，原始 state 用于动作坐标转换；超过 2 秒未刷新标记过期。已提交、当前推理、最近返回任务版本分开显示，它们不等同于实际已执行版本；当前 client 没有回传执行确认。
 
 ### 验证控制台
 
-以下测试使用 CPU 假模型和临时 checkpoint，覆盖 HTTP、真实 WebSocket 往返、推理期间更新任务、RTC 前缀传递、两种 policy、加载失败恢复及目录边界，不向机器人发送动作：
+运行纯 CPU 回归测试（覆盖控制台安全边界、并发加载防竞态、预览编码、`msgpack_numpy` 校验、归一化统计与参数解析）：
 
 ```bash
 python -m unittest discover -s tests -v
 ```
-
-真实权重的控制台端到端测试使用：
-
-```bash
-python scripts/test_console_gpu.py \
-  --vla /path/to/vla/hf_ckpt \
-  --action /path/to/action_posttrain/hf_ckpt \
-  --data-path /path/to/recorded/lerobot_dataset \
-  --report outputs/console_gpu_report.json
-```
-
-测试在本机临时端口启动独立控制台，通过 HTTP 加载、实际 `WebsocketClientPolicy` 连接和 CUDA 推理验证两种策略。两份权重需使用同一机器人映射并支持 RTC，录制数据的原生字段需与权重内配置一致。两者发送同一份完整观测；测试覆盖完整 chunk、0 到训练上限的 RTC 前缀、真实推理期间更新 task、下一轮文本 token 变化、头部历史保留、图像/state 预览、reset 和卸载。
-
-默认每档 delay 预热 3 次、测量 20 次，可以通过 `--warmup` 和 `--repeats` 调整。报告分别记录加载耗时、首次请求耗时，以及预热后的服务端/本机 WebSocket 往返延迟 P50/P95 和原始样本。首次请求不计入稳定延迟。
-
-对比编译开关时，用相同权重、数据和参数运行上述命令两次，分别保存报告；第二次加 `--use-compile`。默认 `torch.compile` 在第一次推理时才真正编译，因此“加载成功”不代表编译已完成。测试的单请求超时为 900 秒（可用 `--request-timeout` 修改），报告还记录切换 task 后是否捕获新计算图，以及首次新任务的延迟。编译日志中可能出现 graph break；报告中的 `compiler_counters` 可用于区分实际编译与完全 eager 执行。
-
-可将 `OMP_NUM_THREADS=4` 同时用于两次测量，并在编译测试设置 `TORCHINDUCTOR_COMPILE_THREADS=4` 控制 CPU 编译并行度。使用独立 `TORCHINDUCTOR_CACHE_DIR` 和 `TRITON_CACHE_DIR` 可测量首次缓存构建成本；重复使用该目录测得的是缓存启动时间。报告中的延迟仅代表当前机器、固定录制观测和测试负载，不包含机器人控制器、真实局域网或任务完成时间。
 
 缺少权重时，可通过真实训练入口生成验证包：
 

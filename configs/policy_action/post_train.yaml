@@ -3,17 +3,8 @@
 # 配置独立维护；更换数据 / 动作组成后需重新计算 configs/norm_compute/ 下的统计。
 
 model:
-  # ---- 初始化权重：路径相对仓库根目录 ----
-  vlm_path: pretrained_models/Qwen3.5-2B
+  # 加载独立预训练导出的完整 action policy。
   action_policy_path: outputs/action_pretrain/checkpoints/global_step_50000/hf_ckpt/action_policy
-
-  # ---- 模型结构与注意力后端 ----
-  action_expert_hidden_size: 1024
-  action_expert_intermediate_size: 3072
-  # 第二层环境 attention 的 KV 是否拼接 state token；false 时为 self-attention。
-  use_state: false
-  joint_attention_backend: sdpa
-  vit_attn_implementation: sdpa
 
 data:
   # ---- 数据集与机器人映射 ----
@@ -23,8 +14,8 @@ data:
   robot_config_root: configs/robot_configs
   norm_stats_file: assets/norm_stats/own_robot.json
 
-  # ---- 动作 / 状态特征（当前为 TCP 与夹爪，共 20 维） ----
-  # 动作的每项维度前半是左手、后半是右手。模型先拼左手，再拼右手
+  # ---- 动作 / 状态特征 ----
+  # 双臂 TCP 与夹爪共 20 维。动作向量先左臂、后右臂，每臂按 joints 顺序排列。
   joints:
     # - arm.position: 14
     - end.position: 18
@@ -34,13 +25,12 @@ data:
     - end.position: bounds_99
     - effector.position: minmax
 
-  # ---- 相机顺序：左腕、右腕；不读取头部、任务或子任务 ----
+  # spatial_encoder 按左、右顺序接收当前帧的两张 224×224 腕图。
   cameras:
     - camera_wrist_left
     - camera_wrist_right
-  img_size: 256
 
-  # ---- 标准数据加载（图像统一由 Qwen processor 在 CPU 预处理） ----
+  # ---- 数据加载 ----
   video_backend: torchcodec
   num_workers: 8
   prefetch_factor: 2
@@ -59,9 +49,7 @@ train:
   # ---- 学习率与优化器 ----
   optimizer: adamw
   fused_optimizer: true
-  lr: 5.0e-05
-  action_policy_lr: 1.0e-5
-  freeze_vision_encoder: true
+  lr: 1.0e-5 
   action_loss_weight: 1.0
   weight_decay: 0.0
   lr_decay_style: constant

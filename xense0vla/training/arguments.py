@@ -32,11 +32,6 @@ class PolicyTrainingArguments(TrainingArguments):
             )
         },
     )
-    action_policy_lr: Optional[float] = field(
-        default=None,
-        metadata={"help": "Action policy learning rate; defaults to train.lr."},
-    )
-    freeze_vision_encoder: bool = field(default=True)
     action_loss_weight: float = field(default=1.0)
     action_dim: int = field(
         default=7,
@@ -98,17 +93,16 @@ class VLATrainingArguments(PolicyTrainingArguments):
         default=None,
         metadata={"help": "Optional VLM learning rate; defaults to train.lr."},
     )
-    freeze_action_policy: bool = field(default=False)
+    freeze_action_policy: bool = field(default=True)
+    unfreeze_mot_layers: bool = field(default=False)
     use_subtask_loss: bool = field(
         default=False,
         metadata={"help": "Optional in mid_train and post_train; absent for standalone action training."},
     )
     subtask_max_length: int = field(default=100)
     language_loss_weight: float = field(default=1.0)
-    head_history_offset: int = field(
-        default=30,
-        metadata={"help": "Head-camera history offset in dataset frames; episode starts clamp to frame zero."},
-    )
+    history_memory: Optional[int] = field(default=None, metadata={"help": "Historical head frames. Defaults to 3 or the full VLA checkpoint value."})
+    history_stride: Optional[int] = field(default=None, metadata={"help": "Head-frame interval. Defaults to 30 or the full VLA checkpoint value."})
     tokenizer_max_length: int = field(
         default=72,
         metadata={"help": "Maximum length of the tokenizer."},
@@ -146,10 +140,6 @@ class PolicyDataArguments(DataArguments):
         metadata={"help": "Logical cameras decoded and preprocessed by the data pipeline."},
     )
     norm_type: Optional[List[str]] = field(default=None, metadata={"help": "Normalization type."})
-    img_size: int = field(
-        default=256,
-        metadata={"help": "Size of the image."},
-    )
     norm_stats_file: str = field(
         default=None,
         metadata={"help": "Path to the normalization stats file."},
@@ -174,6 +164,10 @@ class VLAArguments:
 
 def validate_training_configuration(args, *, standalone: bool) -> None:
     """Validate independent architecture, loss and RTC options before model allocation."""
+    if getattr(args.train, "rmpad", False) or getattr(args.train, "rmpad_with_pos_ids", False):
+        raise ValueError(
+            "VLA requires regular padded batches; set both rmpad and rmpad_with_pos_ids to false."
+        )
     use_subtask = bool(getattr(args.train, "use_subtask_loss", False))
     if standalone and use_subtask:
         raise ValueError("Standalone action policy training has no subtask objective.")
@@ -183,9 +177,13 @@ def validate_training_configuration(args, *, standalone: bool) -> None:
         raise ValueError("Standalone training must train its action policy.")
     if getattr(args.train, "tokenizer_max_length", 72) != 72 or getattr(args.train, "subtask_max_length", 100) != 100:
         raise ValueError("The task and subtask regions must contain exactly 72 and 100 token slots.")
-    if getattr(args.train, "head_history_offset", 30) < 0:
-        raise ValueError("head_history_offset must be non-negative.")
-    for name in ("lr", "vlm_lr", "action_policy_lr"):
+    memory = getattr(args.train, "history_memory", None)
+    stride = getattr(args.train, "history_stride", None)
+    if (memory is not None and memory < 0) or (stride is not None and stride < 1):
+        raise ValueError("history_memory must be non-negative and history_stride positive.")
+    if getattr(args.train, "unfreeze_mot_layers", False) and not args.train.freeze_action_policy:
+        raise ValueError("unfreeze_mot_layers applies when freeze_action_policy is enabled.")
+    for name in ("lr", "vlm_lr", "spatial_encoder_lr"):
         value = getattr(args.train, name, None)
         if value is not None and value <= 0:
             raise ValueError(f"train.{name} must be positive.")
@@ -196,12 +194,14 @@ def validate_training_configuration(args, *, standalone: bool) -> None:
         expected.insert(0, "camera_top")
     if list(args.data.cameras or expected) != expected:
         raise ValueError(f"cameras must preserve this order: {expected}.")
-    if args.data.img_size != 256:
-        raise ValueError("The fixed Qwen image layout requires data.img_size=256.")
     rtc = dict(args.train.rtc_training or {})
-    if rtc.get("delay_sampling", "uniform") != "uniform" or any(
-        key in rtc for key in ("delay_weights", "zero_delay_probability")
-    ):
+    allowed_rtc_keys = {"enabled", "max_delay_steps", "delay_sampling"}
+    unknown_rtc_keys = set(rtc) - allowed_rtc_keys
+    if unknown_rtc_keys:
+        if any(key in unknown_rtc_keys for key in ("delay_weights", "zero_delay_probability")):
+            raise ValueError("RTC samples every integer delay uniformly; sampling weights are unsupported.")
+        raise ValueError(f"Unknown rtc_training fields: {sorted(unknown_rtc_keys)}")
+    if rtc.get("delay_sampling", "uniform") != "uniform":
         raise ValueError("RTC samples every integer delay uniformly; sampling weights are unsupported.")
     rtc["enabled"] = bool(rtc.get("enabled", False))
     rtc["delay_sampling"] = "uniform"
@@ -212,4 +212,6 @@ def validate_training_configuration(args, *, standalone: bool) -> None:
         if not 1 <= max_delay < args.train.chunk_size:
             raise ValueError("rtc_training.max_delay_steps must lie in [1, chunk_size).")
         rtc["max_delay_steps"] = max_delay
+    else:
+        rtc["max_delay_steps"] = 0
     args.train.rtc_training = rtc

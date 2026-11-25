@@ -18,11 +18,12 @@ bash train.sh tasks/train_vla.py configs/policy_vla/mid_train.yaml \
 
 | 参数 | 含义 |
 | --- | --- |
-| `model.vlm_path` | 本地 Qwen3.5-2B 目录；独立策略必填，VLA 从 Qwen 初始化时使用 |
+| `model.spatial_encoder_path` | DA3-LARGE 权重目录，用于初始化 `spatial_encoder` 的 Transformer 主干 |
+| `model.vlm_path` | 首次组装 VLA 时使用的 Qwen3.5-2B 目录 |
 | `model.action_policy_path` | 独立策略导出的 `hf_ckpt/action_policy/`；独立预训练可不填，独立后训练和 mid_train 需填写 |
 | `model.model_path` | 完整 VLA 的 `hf_ckpt/`；与 `vlm_path`、`action_policy_path` 互斥 |
 
-模型类型由训练入口决定。完整模型部署包必须包含 `config.json`、模型权重、`vla_cli.yaml`、`vlm_backbone/` 和 `runtime_assets/`；动作迁移包必须包含 `vision_encoder/`。
+模型类型由训练入口决定。部署包包含 `config.json`、模型权重、`vla_cli.yaml` 和 `runtime_assets/`。完整 VLA 另含 Qwen 的 `vlm_backbone/`。
 
 ## 数据与动作
 
@@ -32,13 +33,12 @@ bash train.sh tasks/train_vla.py configs/policy_vla/mid_train.yaml \
 | `data.data_name` | 机器人映射名，或 `multi` |
 | `data.norm_stats_file` | 训练使用的归一化统计 |
 | `data.cameras` | 独立策略为左腕、右腕；VLA 为头部、左腕、右腕 |
-| `data.img_size` | 当前固定为 256 |
+| `wrist_image_size` / `head_image_size` | 保存在模型配置中，腕部固定 224、头部固定 256 |
 | `data.video_backend` | `torchcodec` 或 `pyav` |
 | `train.action_dim` | 实际动作维度 |
-| `train.max_action_dim` / `train.max_state_dim` | 模型动作 / 状态维度，包含预留 padding |
+| `train.max_action_dim` / `train.max_state_dim` | 动作 / 数据管线中的状态维度，包含预留 padding |
 | `train.chunk_size` | 每次生成的动作步数，示例为 50 |
 | `train.num_steps` | 动作去噪步数，示例为 5 |
-| `model.use_state` | 是否向第二层环境 attention 的 KV 拼接投影后的 state token；默认 false，四份配置均关闭 |
 
 相机与原生数据字段映射、统计计算见 [数据指南](data.md)。
 
@@ -47,16 +47,15 @@ bash train.sh tasks/train_vla.py configs/policy_vla/mid_train.yaml \
 | 参数 | 含义 |
 | --- | --- |
 | `train.lr` | 基础学习率，也是模块学习率的回退值 |
-| `train.action_policy_lr` | 动作网络学习率 |
-| `train.vlm_lr` | 完整 VLA 的语言模型及解冻后的视觉编码器学习率 |
-| `train.freeze_vision_encoder` | 默认 true；所有训练配置都可设为 false |
-| `train.freeze_action_policy` | 完整 VLA 可设为 true，默认 false |
+| `train.spatial_encoder_lr` | 独立预训练时，`spatial_encoder` 中预训练 Transformer 主干的学习率。默认为 `train.lr` 的 0.1 倍。编码器的两层卷积使用 `train.lr` |
+| `train.vlm_lr` | 完整 VLA 的 Qwen 语言模型和头部视觉塔共用的学习率 |
+| `train.freeze_action_policy` | 完整 VLA 默认 true，冻结动作策略主干 |
+| `train.unfreeze_mot_layers` | 代码默认 false；`mid_train.yaml` 默认 true，配合 `freeze_action_policy=true` 解冻动作侧 6 个 MoT 耦合 block（第 3/6/9/12/15/18 层） |
 | `train.use_subtask_loss` | 仅完整 VLA；**mid_train 示例默认 true**，后训练示例默认 false |
 | `train.language_loss_weight` / `train.action_loss_weight` | 两个损失的权重，示例均为 1.0 |
-| `train.head_history_offset` | 完整 VLA 的头部历史帧偏移，默认 30，不得为负 |
+| `train.history_memory` | 头部历史帧数，默认 3，设为 0 时只看当前帧 |
+| `train.history_stride` | 相邻历史帧的间隔，单位为数据帧或控制步，默认 30，必须为正 |
 | `train.tokenizer_max_length` / `train.subtask_max_length` | 当前固定为 72 / 100 |
-
-独立策略解冻后的视觉编码器使用 `train.lr`。独立入口不接受语言学习率、头部历史或子任务监督参数。
 
 ## 训练资源与保存
 
@@ -70,7 +69,7 @@ bash train.sh tasks/train_vla.py configs/policy_vla/mid_train.yaml \
 | `train.output_dir` | 训练输出目录 |
 | `train.max_steps` / `train.save_steps` | 总优化步数 / checkpoint 保存间隔 |
 | `train.enable_resume` | 从输出目录恢复 DCP 训练状态 |
-| `train.use_wandb` | 是否上传训练日志，默认关闭 |
+| `train.use_wandb` | 是否上传训练日志（代码默认 true，示例 YAML 设为 false） |
 
 ## RTC
 

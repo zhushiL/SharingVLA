@@ -33,8 +33,12 @@ class custom_save_on_cpu(saved_tensors_hooks):
 
         def pack_to_cpu(tensor: torch.Tensor) -> Tuple[OffloadPolicy, torch.device, torch.Tensor]:
             tensor_num_bytes = tensor.element_size() * tensor.nelement()
-            # heuristic to skip nn.Linear.weight
-            if type(tensor.grad_fn).__name__ == "TBackward0" or tensor_num_bytes <= min_offload_size:
+            # Skip non-CUDA tensors, small tensors, and transposed Linear weights.
+            if (
+                not tensor.is_cuda
+                or type(tensor.grad_fn).__name__ == "TBackward0"
+                or tensor_num_bytes <= min_offload_size
+            ):
                 return (OffloadPolicy.IGNORE, tensor.device, tensor)
 
             if self.cur_gpu_ram_in_mb < gpu_limit_in_gb * 1024:
@@ -50,7 +54,7 @@ class custom_save_on_cpu(saved_tensors_hooks):
                 layout=tensor.layout,
                 pin_memory=(not tensor.is_sparse),
             )
-            packed.copy_(tensor)
+            packed.copy_(tensor, non_blocking=True)
             return (OffloadPolicy.OFFLOAD, tensor.device, packed)
 
         def unpack_from_cpu(packed: Tuple[OffloadPolicy, torch.device, torch.Tensor]) -> torch.Tensor:
@@ -60,12 +64,16 @@ class custom_save_on_cpu(saved_tensors_hooks):
                 return tensor
             elif offload_policy == OffloadPolicy.KEEP_ON_GPU:
                 tensor_num_bytes = tensor.element_size() * tensor.nelement()
-                self.cur_gpu_ram_in_mb -= tensor_num_bytes / 1024 / 1024
+                self.cur_gpu_ram_in_mb = max(0.0, self.cur_gpu_ram_in_mb - tensor_num_bytes / 1024 / 1024)
                 return tensor
             else:
                 return tensor.to(device, non_blocking=pin_memory)
 
         super().__init__(pack_to_cpu, unpack_from_cpu)
+
+    def __enter__(self) -> None:
+        self.cur_gpu_ram_in_mb = 0.0
+        super().__enter__()
 
 
 def build_activation_offloading_context(

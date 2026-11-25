@@ -32,29 +32,51 @@ def asset(root, value):
     return path
 
 
+def _is_reset_flag(value) -> bool:
+    return isinstance(value, (bool, np.bool_)) and bool(value)
+
+
+def _preview_uint8_rgb(frame: np.ndarray) -> np.ndarray:
+    if frame.ndim != 3:
+        raise ValueError("expected RGB image")
+    if frame.shape[-1] != 3 and frame.shape[0] == 3:
+        frame = frame.transpose(1, 2, 0)
+    if frame.shape[-1] != 3:
+        raise ValueError("expected 3-channel RGB image")
+    if frame.dtype == np.uint8:
+        return frame
+    if np.issubdtype(frame.dtype, np.floating):
+        arr = frame.astype(np.float32, copy=False)
+        if arr.size > 0 and float(np.nanmax(arr)) <= 1.0 + 1e-3:
+            arr = np.clip(arr, 0.0, 1.0) * 255.0
+        return np.clip(np.rint(arr), 0.0, 255.0).astype(np.uint8)
+    raise ValueError(f"unsupported preview image dtype: {frame.dtype}")
+
+
 def inspect_checkpoint(path):
     root = Path(path).expanduser().resolve()
-    config = json.loads((root / "config.json").read_text())
-    manifest = yaml.safe_load((root / "vla_cli.yaml").read_text())
+    config = json.loads(asset(root, "config.json").read_text())
+    manifest = yaml.safe_load(asset(root, "vla_cli.yaml").read_text())
     if not isinstance(config, dict) or not isinstance(manifest, dict) or not isinstance(manifest.get("data"), dict):
         raise ValueError("模型配置或 vla_cli.yaml 的 data 配置无效")
     if config.get("model_type") != "vla":
-        raise ValueError("请选择完整 hf_ckpt 目录，不能选择 action_policy 子目录")
-    backbone = asset(root, "vlm_backbone")
-    asset(root, "vlm_backbone/config.json")
-    # Transformers can bundle the image processor inside processor_config.json
-    # instead of exporting a separate preprocessor_config.json.
-    processor_path = backbone / "processor_config.json"
-    processor = json.loads(processor_path.read_text()) if processor_path.is_file() else {}
-    bundled_image_processor = (
-        isinstance(processor, dict)
-        and isinstance(processor.get("image_processor"), dict)
-        and bool(processor["image_processor"])
-    )
-    if not any(backbone.glob("*preprocessor*.json")) and not bundled_image_processor:
-        raise ValueError("vlm_backbone 缺少图像处理配置")
-    if not config.get("standalone_action_policy", False) and not (backbone / "tokenizer_config.json").is_file():
-        raise ValueError("VLA 缺少本地 tokenizer_config.json")
+        raise ValueError("请选择含有策略配置和权重的目录")
+    if not config.get("standalone_action_policy", False):
+        backbone = asset(root, "vlm_backbone")
+        asset(root, "vlm_backbone/config.json")
+        # Transformers can bundle the image processor inside processor_config.json
+        # instead of exporting a separate preprocessor_config.json.
+        processor_path = backbone / "processor_config.json"
+        processor = json.loads(processor_path.read_text()) if processor_path.is_file() else {}
+        bundled_image_processor = (
+            isinstance(processor, dict)
+            and isinstance(processor.get("image_processor"), dict)
+            and bool(processor["image_processor"])
+        )
+        if not any(backbone.glob("*preprocessor*.json")) and not bundled_image_processor:
+            raise ValueError("vlm_backbone 缺少图像处理配置")
+        if not (backbone / "tokenizer_config.json").is_file():
+            raise ValueError("VLA 缺少本地 tokenizer_config.json")
     indexes = list(root.glob("*.safetensors.index.json"))
     if indexes:
         for index in indexes:
@@ -84,8 +106,14 @@ def inspect_checkpoint(path):
 
 def robot_schema(path, robot):
     root = Path(path).resolve()
-    data = yaml.safe_load((root / "vla_cli.yaml").read_text())["data"]
-    config = yaml.safe_load(asset(root, data["robot_config_root"]).joinpath(f"{robot}.yaml").read_text())
+    data = yaml.safe_load(asset(root, "vla_cli.yaml").read_text())["data"]
+    if Path(robot).name != robot or robot in {"", ".", ".."}:
+        raise ValueError(f"非法的机器人名称: {robot!r}")
+    robot_root = asset(root, data["robot_config_root"])
+    robot_file = (robot_root / f"{robot}.yaml").resolve()
+    if not robot_file.is_relative_to(robot_root) or not robot_file.is_file():
+        raise ValueError(f"缺少机器人配置: {robot}.yaml")
+    config = yaml.safe_load(robot_file.read_text())
     cameras, states, labels, xyz = [], set(), {}, []
     for entry in config.get("images", []):
         if isinstance(entry, str):
@@ -137,15 +165,14 @@ def encode_preview(snapshot):
             continue
         try:
             arr = np.asarray(obs[key])
-            frames = [("", arr)] if arr.ndim == 3 else [("", arr[-1]), (" / history", arr[0])]
+            if arr.ndim == 3:
+                frames = [("", arr)]
+            else:
+                frames = [("", arr[-1])] + [
+                    (f" / history {lag}", frame) for lag, frame in enumerate(arr[-2::-1], start=1)
+                ]
             for suffix, frame in frames:
-                if frame.ndim != 3:
-                    raise ValueError("expected RGB image")
-                if frame.shape[-1] != 3 and frame.shape[0] == 3:
-                    frame = frame.transpose(1, 2, 0)
-                if frame.dtype != np.uint8 or frame.shape[-1] != 3:
-                    raise ValueError("expected uint8 RGB")
-                im = Image.fromarray(frame)
+                im = Image.fromarray(_preview_uint8_rgb(frame))
                 im.thumbnail((768, 480))
                 stream = io.BytesIO()
                 im.save(stream, format="JPEG", quality=75)
@@ -155,8 +182,11 @@ def encode_preview(snapshot):
     states = {}
     for key in schema["states"]:
         if key in obs:
-            a = np.asarray(obs[key], dtype=float).reshape(-1)
-            states[key] = [float(x) if np.isfinite(x) else None for x in a]
+            try:
+                a = np.asarray(obs[key], dtype=float).reshape(-1)
+                states[key] = [float(x) if np.isfinite(x) else None for x in a]
+            except (ValueError, TypeError) as error:
+                errors.append(f"{key}: {error}")
     return {**info, "images": images, "states": states, "errors": errors}
 
 
@@ -184,8 +214,21 @@ class ConsoleRuntime:
         self.pending_preview = None
         self.preview = None
         self.preview_task = None
+        self._preview_event: asyncio.Event | None = None
+        self._last_preview_poll = 0.0
         self.generation = 0
         self.last_prefix_length = 0
+
+    def mark_preview_polled(self):
+        self._last_preview_poll = time.monotonic()
+        if self.pending_preview is not None and self._preview_event is not None:
+            self._preview_event.set()
+
+    def preview_key(self) -> str:
+        if not self.preview:
+            return ""
+        p = self.preview
+        return f"{p.get('session_id')}:{p.get('observation_epoch')}:{p.get('sequence')}"
 
     async def model_call(self, fn, *args, **kwargs):
         return await asyncio.get_running_loop().run_in_executor(self.worker, partial(fn, *args, **kwargs))
@@ -219,7 +262,8 @@ class ConsoleRuntime:
                 "task_version": self.task_version, "active_task_version": self.active_task_version,
                 "result_task_version": self.result_task_version, "infer_ms": self.infer_ms,
                 "client": self.client, "session_id": self.session_id, "request_seq": self.request_seq,
-                "busy": self.busy, "rtc_prefix_length": self.last_prefix_length}
+                "busy": self.busy, "rtc_prefix_length": self.last_prefix_length,
+                "preview_key": self.preview_key(), "server_time": time.time()}
 
     async def load(self, info, robot, dtype="bfloat16", compile_model=False):
         self.phase, self.error = "loading", None
@@ -258,7 +302,7 @@ class ConsoleRuntime:
             raise ValueError("仅支持一个在途推理请求")
         self.busy = True
         try:
-            if raw.get("reset") is True:
+            if _is_reset_flag(raw.get("reset")):
                 if raw.get("robo_name") != self.metadata["robot_name"]:
                     raise ValueError("reset 的机器人必须与页面选择一致")
                 result = await self.model_call(self.policy.infer, raw)
@@ -284,15 +328,25 @@ class ConsoleRuntime:
                         raise ValueError(f"{key} 必须是有限数值")
                     info[key] = value
             self.pending_preview = (dict(obs), info, self.schema)
+            if self._preview_event is None:
+                self._preview_event = asyncio.Event()
             if self.preview_task is None:
                 self.preview_task = asyncio.create_task(self.preview_loop())
+            self._preview_event.set()
             if full_vla and not task:
                 return {"action": None, "status": "task_required", "console": info}
+            raw_prefix_len = obs.get("rtc_prefix_length")
+            if raw_prefix_len is None:
+                parsed_prefix_len = 0
+            elif isinstance(raw_prefix_len, bool) or not isinstance(raw_prefix_len, (int, np.integer)):
+                raise TypeError("rtc_prefix_length must be an integer.")
+            else:
+                parsed_prefix_len = int(raw_prefix_len)
             self.active_task_version = version
-            self.last_prefix_length = int(obs.get("rtc_prefix_length", 0))
             started = time.monotonic()
             result = await self.model_call(self.policy.infer, obs)
             self.infer_ms = (time.monotonic() - started) * 1000
+            self.last_prefix_length = parsed_prefix_len
             self.result_task_version = version
             self.error = None
             return {**result, "console": {**info, "task": task}, "status": "ok"}
@@ -304,17 +358,32 @@ class ConsoleRuntime:
             self.active_task_version = None
 
     async def preview_loop(self):
+        min_interval = 1.0 / self.preview_fps
+        last_encoded = 0.0
         while True:
-            if self.pending_preview is not None:
-                snapshot, generation = self.pending_preview, self.generation
-                self.pending_preview = None
-                try:
-                    result = await asyncio.get_running_loop().run_in_executor(self.preview_worker, encode_preview, snapshot)
-                    if generation == self.generation:
-                        self.preview = result
-                except Exception:
-                    log.exception("Preview encoding failed (inference is unaffected)")
-            await asyncio.sleep(1 / self.preview_fps)
+            if self._preview_event is None:
+                self._preview_event = asyncio.Event()
+            await self._preview_event.wait()
+            self._preview_event.clear()
+            if self.pending_preview is None:
+                continue
+            # Skip JPEG encoding while no browser has polled recently (keep first frame).
+            if self.preview is not None and (time.monotonic() - self._last_preview_poll) > 10.0:
+                continue
+            elapsed = time.monotonic() - last_encoded
+            if elapsed < min_interval:
+                await asyncio.sleep(min_interval - elapsed)
+            if self.pending_preview is None:
+                continue
+            snapshot, generation = self.pending_preview, self.generation
+            self.pending_preview = None
+            try:
+                result = await asyncio.get_running_loop().run_in_executor(self.preview_worker, encode_preview, snapshot)
+                last_encoded = time.monotonic()
+                if generation == self.generation:
+                    self.preview = result
+            except Exception:
+                log.exception("Preview encoding failed (inference is unaffected)")
 
     async def close(self):
         if self.preview_task:

@@ -187,9 +187,9 @@ def get_context_parallel_rank():
 def get_context_parallel_world_size():
     """Return world size for the context parallel group."""
     if dist.is_available() and dist.is_initialized():
-        return dist.get_world_size(group=get_context_parallel_group())
-    else:
-        return 0
+        group = get_context_parallel_group(check_initialized=False)
+        return dist.get_world_size(group=group) if group is not None else 1
+    return 1
 
 
 # ----------------------------- Unified Parallel ---------------------------- #
@@ -334,9 +334,9 @@ def is_ulysses_sequence_parallel_initialized() -> bool:
 
 def is_context_parallel_initialized() -> bool:
     """
-    Check if ulysses sequence parallel is initialized.
+    Check if context parallel is initialized.
     """
-    return get_context_parallel_group() is not None
+    return get_context_parallel_group(check_initialized=False) is not None
 
 
 def get_ulysses_group_key_context(group_key: str = "default"):

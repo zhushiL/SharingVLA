@@ -45,7 +45,7 @@ data:
 | `camera_wrist_left` | `observation.images.left_wrist` |
 | `camera_wrist_right` | `observation.images.right_wrist` |
 
-独立 action policy 使用左右腕相机；完整 VLA 使用头部、左右腕相机，并读取 `t-head_history_offset` 与 `t` 的头部图像。历史不足时使用当前 episode 首帧。
+独立策略读取左、右腕当前 RGB 帧（224×224），完整 VLA 还读取 256×256 头图。`history_memory=3` 和 `history_stride=30` 对应按顺序采样 t−90、t−60、t−30 和 t。超出 episode 起点的索引逐一钳制到首帧。state 保留在数据与动作坐标转换中。
 
 `robot1.yaml`、`robot2.yaml`、`robot3.yaml` 分别适配夹爪位于向量末尾、腕相机带重复前缀、全局相机名为 `top` 等字段差异。各数据集使用哪份映射由清单第一列指定。
 

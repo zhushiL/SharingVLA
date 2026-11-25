@@ -53,12 +53,17 @@ class RunningStats:
         """
         if batch.ndim == 1:
             batch = batch.reshape(-1, 1)
+        if batch.shape[0] == 0:
+            return
 
+        batch = np.asarray(batch, dtype=np.float64)
         num_elements, vector_length = batch.shape
+        batch_mean = np.mean(batch, axis=0)
+        batch_mean_of_squares = np.mean(batch**2, axis=0)
 
         if self._count == 0:
-            self._mean = np.mean(batch, axis=0)
-            self._mean_of_squares = np.mean(batch**2, axis=0)
+            self._mean = batch_mean
+            self._mean_of_squares = batch_mean_of_squares
             self._min = np.min(batch, axis=0)
             self._max = np.max(batch, axis=0)
             self._histograms = [np.zeros(self._num_quantile_bins) for _ in range(vector_length)]
@@ -66,27 +71,23 @@ class RunningStats:
                 np.linspace(self._min[i] - 1e-10, self._max[i] + 1e-10, self._num_quantile_bins + 1)
                 for i in range(vector_length)
             ]
+            self._count = num_elements
         else:
             if vector_length != self._mean.size:
                 raise ValueError("The length of new vectors does not match the initialized vector length.")
             new_max = np.max(batch, axis=0)
             new_min = np.min(batch, axis=0)
-            max_changed = np.any(new_max > self._max)
-            min_changed = np.any(new_min < self._min)
+            changed_mask = (new_max > self._max) | (new_min < self._min)
             self._max = np.maximum(self._max, new_max)
             self._min = np.minimum(self._min, new_min)
 
-            if max_changed or min_changed:
-                self._adjust_histograms()
+            if np.any(changed_mask):
+                self._adjust_histograms(np.flatnonzero(changed_mask))
 
-        self._count += num_elements
-
-        batch_mean = np.mean(batch, axis=0)
-        batch_mean_of_squares = np.mean(batch**2, axis=0)
-
-        # Update running mean and mean of squares.
-        self._mean += (batch_mean - self._mean) * (num_elements / self._count)
-        self._mean_of_squares += (batch_mean_of_squares - self._mean_of_squares) * (num_elements / self._count)
+            self._count += num_elements
+            # Update running mean and mean of squares.
+            self._mean += (batch_mean - self._mean) * (num_elements / self._count)
+            self._mean_of_squares += (batch_mean_of_squares - self._mean_of_squares) * (num_elements / self._count)
 
         self._update_histograms(batch)
 
@@ -104,28 +105,33 @@ class RunningStats:
         stddev = np.sqrt(np.maximum(0, variance))
         q01, q99 = self._compute_quantiles([0.01, 0.99])
         q02, q98 = self._compute_quantiles([0.02, 0.98])
+        mean = self._mean.copy()
+        min_val = self._min.copy()
+        max_val = self._max.copy()
 
         if chunk_size is not None:
             assert isinstance(chunk_size, int)
-            self._mean = self._mean.reshape(chunk_size, -1)
-            self._min = self._min.reshape(chunk_size, -1)
-            self._max = self._max.reshape(chunk_size, -1)
+            mean = mean.reshape(chunk_size, -1)
+            min_val = min_val.reshape(chunk_size, -1)
+            max_val = max_val.reshape(chunk_size, -1)
             stddev = stddev.reshape(chunk_size, -1)
             q01 = q01.reshape(chunk_size, -1)
             q99 = q99.reshape(chunk_size, -1)
             q02 = q02.reshape(chunk_size, -1)
             q98 = q98.reshape(chunk_size, -1)
 
-        return NormStats(mean=self._mean, std=stddev, q01=q01, q99=q99, q02=q02, q98=q98, min=self._min, max=self._max)
+        return NormStats(mean=mean, std=stddev, q01=q01, q99=q99, q02=q02, q98=q98, min=min_val, max=max_val)
 
-    def _adjust_histograms(self):
-        """Adjust histograms when min or max changes."""
-        for i in range(len(self._histograms)):
+    def _adjust_histograms(self, changed_dims=None):
+        """Adjust histograms only for dimensions whose min or max changed."""
+        dims = range(len(self._histograms)) if changed_dims is None else changed_dims
+        for i in dims:
             old_edges = self._bin_edges[i]
-            new_edges = np.linspace(self._min[i], self._max[i], self._num_quantile_bins + 1)
+            old_centers = 0.5 * (old_edges[:-1] + old_edges[1:])
+            new_edges = np.linspace(self._min[i] - 1e-10, self._max[i] + 1e-10, self._num_quantile_bins + 1)
 
-            # Redistribute the existing histogram counts to the new bins
-            new_hist, _ = np.histogram(old_edges[:-1], bins=new_edges, weights=self._histograms[i])
+            # Redistribute existing counts using bin centers so bin-0 is never dropped.
+            new_hist, _ = np.histogram(old_centers, bins=new_edges, weights=self._histograms[i])
 
             self._histograms[i] = new_hist
             self._bin_edges[i] = new_edges
@@ -140,11 +146,12 @@ class RunningStats:
         """Compute quantiles based on histograms."""
         results = []
         for q in quantiles:
-            target_count = q * self._count
             q_values = []
             for hist, edges in zip(self._histograms, self._bin_edges, strict=True):
                 cumsum = np.cumsum(hist)
-                idx = np.searchsorted(cumsum, target_count)
+                total = float(cumsum[-1]) if cumsum.size > 0 else 0.0
+                target_count = q * (total if total > 0.0 else self._count)
+                idx = min(int(np.searchsorted(cumsum, target_count)), len(edges) - 1)
                 q_values.append(edges[idx])
             results.append(np.array(q_values))
         return results
@@ -228,9 +235,10 @@ class RunningStats:
             acc = np.zeros(num_bins)
             for o in valid:
                 old_edges = o._bin_edges[dim]
+                old_centers = 0.5 * (old_edges[:-1] + old_edges[1:])
                 old_hist = o._histograms[dim]
-                # Same rebin approach as _adjust_histograms
-                rebinned, _ = np.histogram(old_edges[:-1], bins=new_edges, weights=old_hist)
+                # Redistribute via bin centers so boundary bins are preserved.
+                rebinned, _ = np.histogram(old_centers, bins=new_edges, weights=old_hist)
                 acc += rebinned
             merged_histograms.append(acc)
             merged_bin_edges.append(new_edges)
@@ -262,47 +270,39 @@ def deserialize_json(data: str) -> dict[str, NormStats]:
     return _NormStatsDict(**json.loads(data)).norm_stats
 
 
-def save(directory: pathlib.Path | str, norm_stats: dict[str, NormStats], count: int) -> None:
-    """Save the normalization stats to a directory."""
-    path = pathlib.Path(directory)
+def save(path_or_dir: pathlib.Path | str, norm_stats: dict[str, NormStats], count: int) -> None:
+    """Save the normalization stats to a file path or directory."""
+    path = pathlib.Path(path_or_dir)
+    if path.is_dir() or not path.suffix:
+        path = path / "norm_stats.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(serialize_json(norm_stats, count))
 
 
-def load(directory: pathlib.Path | str) -> dict[str, NormStats]:
-    """Load the normalization stats from a directory."""
-    path = pathlib.Path(directory) / "norm_stats.json"
+def load(path_or_dir: pathlib.Path | str) -> dict[str, NormStats]:
+    """Load the normalization stats from a file path or directory."""
+    path = pathlib.Path(path_or_dir)
+    if path.is_dir():
+        path = path / "norm_stats.json"
+    elif not path.exists() and (path / "norm_stats.json").exists():
+        path = path / "norm_stats.json"
     if not path.exists():
         raise FileNotFoundError(f"Norm stats file not found at: {path}")
     return deserialize_json(path.read_text())
 
 
-class RunningStatsState(pydantic.BaseModel):
-    """Model for persisting the internal state of RunningStats"""
-    model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
-    
-    count: int
-    mean: numpydantic.NDArray
-    mean_of_squares: numpydantic.NDArray
-    min_val: numpydantic.NDArray
-    max_val: numpydantic.NDArray
-    histograms: numpydantic.NDArray  # Shape: (vector_length, num_bins)
-    bin_edges: numpydantic.NDArray   # Shape: (vector_length, num_bins + 1)
-    num_quantile_bins: int
-
 def save_running_state(path: pathlib.Path | str, stats: dict):
-    """Save the full computed intermediate state to JSON"""
+    """Save the full computed intermediate state to JSON."""
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    stats = {key: state.get_state().model_dump_json() for key, state in stats.items()}
-    json.dumps(stats)
-    path.write_text(json.dumps(stats))
+    serialized = {key: state.get_state().model_dump_json() for key, state in stats.items()}
+    path.write_text(json.dumps(serialized))
 
-def load_running_state(path: pathlib.Path | str) -> RunningStats:
-    """Load intermediate state from JSON and restore a RunningStats object"""
+
+def load_running_state(path: pathlib.Path | str) -> dict[str, RunningStats]:
+    """Load intermediate state from JSON and restore RunningStats objects."""
     path = pathlib.Path(path)
     if not path.exists():
         raise FileNotFoundError(f"State file not found: {path}")
     data = json.loads(path.read_text())
-    stats = {key: RunningStats.from_state(RunningStatsState(**json.loads(state))) for key, state in data.items()}
-    return stats
+    return {key: RunningStats.from_state(RunningStatsState(**json.loads(state))) for key, state in data.items()}

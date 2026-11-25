@@ -19,7 +19,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Literal, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Generator, List, Optional, Sequence, Tuple, Union
 
 import torch
 from safetensors import safe_open
@@ -34,7 +34,6 @@ except Exception:
     DIFFUSERS_SAFETENSORS_WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
 from torch import distributed as dist
 from torch import nn
-from tqdm import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 
@@ -45,7 +44,6 @@ from ..utils.helper import empty_cache, get_dtype_size
 if TYPE_CHECKING:
     from transformers import GenerationConfig, PretrainedConfig, PreTrainedModel, PreTrainedTokenizer, ProcessorMixin
 
-    from .loader import VLAWeightLoader
 
     ModelAssets = Union[GenerationConfig, PretrainedConfig, PreTrainedTokenizer, ProcessorMixin]
 
@@ -82,7 +80,6 @@ def init_empty_weights():
 @dataclass
 class StateDictIterator:
     filepath: str
-    prefix: str = ''
 
     def __iter__(self) -> Generator[Tuple[str, "torch.Tensor"], None, None]:
         if self.filepath.endswith(".safetensors"):
@@ -158,10 +155,12 @@ def _dispatch_parameter(
     """
     module, name = _find_submodule(module, name)
     orig_tensor = module._parameters[name].data
-    tensor = tensor.to(orig_tensor)
-    if hasattr(orig_tensor, "device_mesh"):  # dtensor
-        if orig_tensor.device.type == "cpu":
-            raise ValueError("Cannot load dtensor on CPU.")
+    if tensor.shape != orig_tensor.shape:
+        raise ValueError(f"Checkpoint shape {tuple(tensor.shape)} differs from {name} shape {tuple(orig_tensor.shape)}.")
+    tensor = tensor.to(device=orig_tensor.device, dtype=orig_tensor.dtype)
+    if hasattr(orig_tensor, "device_mesh"):
+        if dtensor_factory is None:
+            raise ValueError("Loading sharded parameters requires dtensor_factory.")
 
         device_mesh = getattr(orig_tensor, "device_mesh")
         placements = getattr(orig_tensor, "placements")
@@ -170,29 +169,49 @@ def _dispatch_parameter(
         module._parameters[name].data.copy_(tensor)
 
 
+def cast_model_parameters_dtype(model: "nn.Module", dtype: "torch.dtype") -> "nn.Module":
+    """Cast floating-point parameters and persistent buffers while keeping non-persistent FP32 buffers intact.
+
+    Calling ``model.to(dtype=torch.bfloat16)`` truncates constructor-computed
+    non-persistent RoPE buffers (such as Qwen3.5 ``inv_freq``) to 7 mantissa
+    bits, causing severe phase error during BF16 inference.
+    """
+    for module in model.modules():
+        for name, param in list(module._parameters.items()):
+            if param is not None and param.is_floating_point() and param.dtype != dtype:
+                module._parameters[name] = nn.Parameter(
+                    param.data.to(dtype=dtype),
+                    requires_grad=param.requires_grad,
+                )
+        for name, buf in list(module._buffers.items()):
+            if (
+                buf is not None
+                and buf.is_floating_point()
+                and name not in module._non_persistent_buffers_set
+                and buf.dtype != dtype
+            ):
+                module._buffers[name] = buf.to(dtype=dtype)
+    return model
+
+
 def _dispatch_buffer(
     module: "nn.Module",
     name: str,
     buffer: "torch.Tensor",
 ) -> None:
     """
-    Assigns buffer to an empty model.
+    Assigns buffer to an empty model, preserving non-persistent FP32 precision.
     """
     module, name = _find_submodule(module, name)
     orig_tensor = module._buffers[name].data
-    module._buffers[name] = buffer.to(orig_tensor)
+    if name in module._non_persistent_buffers_set and buffer.is_floating_point():
+        module._buffers[name] = buffer.to(device=orig_tensor.device)
+    else:
+        module._buffers[name] = buffer.to(orig_tensor)
 
 
 def initialize_model_weights(model: "nn.Module") -> None:
-    """Initialize a materialized model with the closest owning HF initializer.
-
-    VLA pre-training builds the composite model on ``meta`` and loads only the
-    VLM checkpoint.  Initializing before dispatching checkpoint tensors makes
-    every new dense expert/head parameter valid, while the subsequent load
-    overwrites all pretrained VLM tensors.  Nested ``PreTrainedModel`` objects
-    keep their own special initialization (notably Qwen3.5 Gated DeltaNet
-    ``A_log``/``dt_bias`` and zero-centered RMSNorm weights).
-    """
+    """Initialize newly allocated weights with the initializer of their owning HF model."""
 
     from transformers import PreTrainedModel
 
@@ -207,11 +226,15 @@ def initialize_model_weights(model: "nn.Module") -> None:
     visit(model, None)
 
 
-def _get_weight_loader(model) -> "VLAWeightLoader":
-    loader_factory = getattr(type(model), "get_weight_loader", None)
-    if loader_factory is None:
-        return None
-    return loader_factory()
+def build_empty_policy(config, dtype):
+    from transformers.initialization import no_init_weights
+    from .modeling_vla import VLAModel
+
+    with init_empty_weights(), no_init_weights():
+        model = cast_model_parameters_dtype(VLAModel(config), dtype)
+    if model.model.backbone is not None:
+        _tie_module_embeddings(model.model.backbone.qwen35)
+    return model
 
 
 def _tie_module_embeddings(module: "nn.Module") -> None:
@@ -226,115 +249,85 @@ def _tie_module_embeddings(module: "nn.Module") -> None:
         logger.debug(f"Could not tie embeddings for {type(module).__name__}: {exc}")
 
 
+def materialize_dcp_model(model, device):
+    """Allocate checkpoint destinations while retaining the constructor's computed buffers."""
+    buffers = dict(model.named_buffers())
+    model.to_empty(device=device)
+    for name, tensor in buffers.items():
+        _dispatch_buffer(model, name, tensor)
+    if model.model.backbone is not None:
+        _tie_module_embeddings(model.model.backbone.qwen35)
+
+
+def _checkpoint_sources(model, path, complete):
+    """Source path, input prefix, destination prefix, and explicitly excluded keys."""
+    if complete:
+        return [(path, "", "", ())]
+    if model.config.standalone_action_policy:
+        return [(path, "model.backbone.", "model.action_policy.spatial_encoder.",
+                 ("model.head.", "model.cam_enc.", "model.cam_dec."))]
+    qwen = model.model.backbone.qwen35
+    skips = ("mtp.", "model.mtp.")
+    if qwen.config.tie_word_embeddings:
+        skips += ("lm_head.",)
+    return [
+        (path, "", "model.backbone.qwen35.", skips),
+        (model.config.action_policy_path, "model.action_policy.", "model.action_policy.", ()),
+    ]
+
+
 @torch.no_grad()
 def load_model_weights(
-    model: Union["nn.Module", "PreTrainedModel"],
+    model,
     weights_path: str,
-    init_device: Literal["cpu", "cuda"] = "cuda",
-    dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
-    load_vlm_only: bool = False,
+    init_device="cuda",
+    dtensor_factory=None,
     load_full_checkpoint: bool = False,
-) -> None:
-    """
-    Loads pre-trained model states in transformers' format.
-    """
-    if load_vlm_only == load_full_checkpoint:
-        raise ValueError(
-            "Exactly one strict initialization mode must be selected: "
-            "Qwen-only initialization or complete checkpoint loading."
-        )
-
-    weight_loader = _get_weight_loader(model)
-    if weight_loader is None:
-        raise TypeError(
-            f"{type(model).__name__} must implement get_weight_loader() for "
-            "strict VLA checkpoint loading."
-        )
-
-    # Constructors run under no_init_weights(), which can skip HF's normal
-    # tying step. Establish aliases before determining strict expected keys.
-    _tie_module_embeddings(model)
-    _tie_module_embeddings(weight_loader.get_vlm_submodule(model))
-    parameter_names = {name for name, _ in model.named_parameters()}
-    # HF state_dict includes tied aliases, while named_parameters omits them.
-    # Require/load the canonical tensor exactly once and restore tying below.
-    parameter_aliases = {
-        name for name, _ in model.named_parameters(remove_duplicate=False)
-        if name not in parameter_names
+):
+    """Strict, streaming initialization from a complete policy or pretrained components."""
+    qwen = model.model.backbone.qwen35 if model.model.backbone is not None else None
+    _tie_module_embeddings(qwen)
+    # to_empty destroys storage, including constructor-computed non-persistent RoPE buffers.
+    buffers = {name: tensor.clone() for name, tensor in model.named_buffers()}
+    persistent = {
+        f"{prefix}.{key}" if prefix else key
+        for prefix, module in model.named_modules()
+        for key, value in module.named_buffers(recurse=False)
+        if key not in module._non_persistent_buffers_set
     }
-    # ``init_empty_weights`` leaves buffers materialized, so preserve their
-    # constructor-computed values (for example rotary frequencies) before
-    # ``to_empty`` materializes the parameters and discards existing storage.
-    buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
-
-    vlm_param_names = weight_loader.get_vlm_para_fullnames(model)
-    logger.info_rank0(f"VLM submodule contains {len(vlm_param_names)} parameters.")
-
+    parameters = set(dict(model.named_parameters()))
+    aliases = set(dict(model.named_parameters(remove_duplicate=False))) - parameters
     model.to_empty(device=init_device)
-    if load_full_checkpoint:
-        # Loading a complete checkpoint is strict: every parameter must
-        # be present and shape-compatible below. Initializing billions of
-        # parameters immediately before overwriting all of them only increases
-        # startup time and memory traffic.
-        logger.info_rank0("Skipping parameter initialization for strict full-checkpoint loading.")
-    else:
+    if model.config.standalone_action_policy and not load_full_checkpoint:
         initialize_model_weights(model)
 
-    if load_full_checkpoint:
-        logger.info_rank0("Loading the complete policy checkpoint.")
-    elif load_vlm_only:
-        logger.info_rank0("Loading Qwen weights and initializing the action policy.")
-
-    # Load checkpoint weight iterators
-    state_dict_iterators = _load_state_dict(weights_path)
-    for state_dict_iterator in tqdm(
-        state_dict_iterators, desc="Loading checkpoint shards", disable=int(os.getenv("LOCAL_RANK", "-1")) > 0
-    ):
-        for ckpt_key, tensor in state_dict_iterator:
-            name = weight_loader.map_ckpt_key(
-                ckpt_key,
-                load_vlm_only=load_vlm_only,
-                load_full_checkpoint=load_full_checkpoint,
-            )
-            if name is None or name in parameter_aliases:
-                continue
-            if name in buffer_dict:
-                buffer_dict[name] = tensor.clone()
-            elif name in parameter_names:
-                parameter_names.remove(name)
-                _dispatch_parameter(model, name, tensor, dtensor_factory)
-            else:
-                mode = "full-checkpoint loading" if load_full_checkpoint else "VLM-only initialization"
-                error_msg = f"Unexpected key {name!r} found during {mode}."
-                logger.info_rank0(error_msg)
-                raise KeyError(error_msg)
-
-        del state_dict_iterator
-        empty_cache()
-
-    for name, buffer in buffer_dict.items():
-        _dispatch_buffer(model, name, buffer)
-
-    missing_vlm_parameters = parameter_names & vlm_param_names
-    if load_vlm_only and missing_vlm_parameters:
-        raise KeyError(
-            "The VLM source checkpoint did not initialize every Qwen3.5 parameter; "
-            f"missing {sorted(missing_vlm_parameters)}."
-        )
-    if load_vlm_only and hasattr(model, "load_additional_pretrained_weights"):
-        model.load_additional_pretrained_weights()
-    if load_full_checkpoint and parameter_names:
-        raise KeyError(
-            "The complete checkpoint is missing model parameters: "
-            f"{sorted(parameter_names)}."
-        )
-    elif parameter_names:
-        logger.info_rank0(f"Initialized {len(parameter_names)} parameters not present in the source checkpoint.")
-
-    # we should tie embeddings after loading weights because to_empty() leads to untied weights,
-    # except for fsdp1 (custom init) and fsdp2 (swap tensor) contexts.
-    _tie_module_embeddings(model)
-    _tie_module_embeddings(weight_loader.get_vlm_submodule(model))
+    for path, source, target, skipped in _checkpoint_sources(model, weights_path, load_full_checkpoint):
+        expected = {name for name in parameters | persistent if name.startswith(target)}
+        if not expected:
+            raise ValueError(f"No model tensors match checkpoint target {target!r}.")
+        for shard in _load_state_dict(path):
+            for key, tensor in shard:
+                if key.startswith(skipped):
+                    continue
+                if not key.startswith(source):
+                    raise KeyError(f"Unexpected key {key!r} in {path}.")
+                name = target + key[len(source):]
+                if name in aliases:
+                    continue
+                if name not in expected:
+                    raise KeyError(f"Unexpected or duplicate tensor {name!r} from {path}.")
+                expected.remove(name)
+                if name in parameters:
+                    _dispatch_parameter(model, name, tensor, dtensor_factory)
+                else:
+                    if tensor.shape != buffers[name].shape:
+                        raise ValueError(f"Buffer {name} has incompatible checkpoint shape {tensor.shape}.")
+                    buffers[name] = tensor
+        if expected:
+            raise KeyError(f"Checkpoint {path} is missing {sorted(expected)}.")
+    for name, tensor in buffers.items():
+        _dispatch_buffer(model, name, tensor)
+    _tie_module_embeddings(qwen)
 
 
 def _get_shard_info(
@@ -486,71 +479,20 @@ def save_model_weights(
 
 
 def save_model_assets(output_dir: Union[str, "os.PathLike"], model_assets: Sequence["ModelAssets"]):
-    """Save regular HF assets plus a portable Qwen3.5 backbone bundle.
+    """Save portable model configuration and, for a complete VLA, its language processor."""
+    config = next(asset for asset in model_assets if getattr(asset, "model_type", None) == "vla")
+    portable = deepcopy(config)
+    portable.vlm_path = portable.action_policy_path = portable.spatial_encoder_path = None
+    portable.tokenizer_path = None if portable.standalone_action_policy else VLM_BACKBONE_SUBDIR
+    portable.save_pretrained(output_dir)
+    if not portable.standalone_action_policy:
+        from transformers.models.qwen3_5 import Qwen3_5Config
 
-    VLA's root ``config.json`` is the composite policy config, while
-    model construction also needs Qwen3.5's original ``config.json``.  The
-    latter therefore lives in ``vlm_backbone/`` together with the sole copy of
-    the processor/tokenizer files.  The checkpoint root remains reserved for
-    composite-model assets and weights.
-    """
-
-    from transformers import AutoConfig
-
-    os.makedirs(output_dir, exist_ok=True)
-    assets = tuple(model_assets)
-    vla_config = next(
-        (asset for asset in assets if getattr(asset, "model_type", None) == "vla"),
-        None,
-    )
-    processor = next(
-        (
-            asset
-            for asset in assets
-            if asset is not vla_config and getattr(asset, "image_processor", None) is not None
-        ),
-        None,
-    )
-
-    for model_asset in assets:
-        if vla_config is not None and model_asset is not vla_config:
-            # VLA reserves the root for its composite config. The
-            # processor is persisted once in the canonical backbone bundle.
-            continue
-        if hasattr(model_asset, "save_pretrained"):
-            asset_to_save = model_asset
-            if model_asset is vla_config:
-                asset_to_save = deepcopy(model_asset)
-                asset_to_save.vlm_path = None
-                asset_to_save.tokenizer_path = VLM_BACKBONE_SUBDIR
-                asset_to_save.vlm_backbone_subdir = VLM_BACKBONE_SUBDIR
-                asset_to_save.action_policy_path = None
-            asset_to_save.save_pretrained(output_dir)
-        else:
-            logger.warning(f"Model asset {model_asset} should implement `save_pretrained`.")
-
-    if vla_config is None:
-        return
-    if processor is None:
-        raise ValueError(
-            "A VLA HF checkpoint must include its processor/tokenizer in `model_assets`."
-        )
-
-    vlm_source = (
-        getattr(vla_config, "vlm_path", None)
-        or getattr(vla_config, "tokenizer_path", None)
-    )
-    if not vlm_source:
-        raise ValueError("Cannot package VLA without its Qwen3.5 config source.")
-
-    qwen_config = AutoConfig.from_pretrained(vlm_source, trust_remote_code=False)
-    if getattr(qwen_config, "model_type", None) != "qwen3_5":
-        raise ValueError(
-            "VLA checkpoint packaging requires a Qwen3.5 config; "
-            f"got {getattr(qwen_config, 'model_type', None)!r} from {vlm_source!r}."
-        )
-
-    backbone_dir = os.path.join(output_dir, VLM_BACKBONE_SUBDIR)
-    os.makedirs(backbone_dir, exist_ok=True)
-    qwen_config.save_pretrained(backbone_dir)
-    processor.save_pretrained(backbone_dir)
+        processor = next((asset for asset in model_assets if getattr(asset, "tokenizer", None) is not None), None)
+        if processor is None:
+            raise ValueError("VLA export requires the Qwen processor and tokenizer.")
+        backbone_dir = os.path.join(output_dir, VLM_BACKBONE_SUBDIR)
+        if not isinstance(portable.backbone_config, dict):
+            raise ValueError("VLA export requires a serialized backbone_config dict.")
+        Qwen3_5Config(**portable.backbone_config).save_pretrained(backbone_dir)
+        processor.save_pretrained(backbone_dir)

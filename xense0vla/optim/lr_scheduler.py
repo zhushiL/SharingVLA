@@ -38,6 +38,18 @@ def build_lr_scheduler(
     lr_min: float = 1e-7,
     lr_start: float = 0.0,
 ):
+    if lr <= 0:
+        raise ValueError(f"lr must be positive, got {lr}.")
+    if lr_min < 0 or lr_min > lr:
+        raise ValueError(f"lr_min ({lr_min}) must lie in [0, lr={lr}].")
+    if not 0.0 <= lr_warmup_ratio <= 1.0:
+        raise ValueError(f"lr_warmup_ratio ({lr_warmup_ratio}) must lie in [0, 1].")
+    if not 0.0 < lr_decay_ratio <= 1.0:
+        raise ValueError(f"lr_decay_ratio ({lr_decay_ratio}) must lie in (0, 1].")
+    if lr_decay_style == "cosine" and lr_warmup_ratio > lr_decay_ratio:
+        raise ValueError(
+            f"lr_warmup_ratio ({lr_warmup_ratio}) cannot exceed lr_decay_ratio ({lr_decay_ratio})."
+        )
     lr_warmup_steps = int(train_steps * lr_warmup_ratio)
     if lr_decay_style == "constant":
         return get_constant_schedule_with_warmup(
@@ -53,6 +65,7 @@ def build_lr_scheduler(
             num_warmup_steps=lr_warmup_steps,
             num_training_steps=train_steps,
             init_lr=lr,
+            min_lr=lr_min,
             lr_start=lr_start,
         )
 
@@ -68,9 +81,14 @@ def build_lr_scheduler(
         )
 
     if lr_decay_style == "two_stage":
+        decay_steps = max(lr_warmup_steps, int(train_steps * lr_decay_ratio))
+        decay_ratio = (lr_min / lr) if lr_min > 0 else 0.2
         return get_two_stage_constant_schedule_with_warmup(
             optimizer=optimizer,
+            num_warmup_steps=lr_warmup_steps,
             init_lr=lr,
+            decay_steps=decay_steps,
+            decay_ratio=decay_ratio,
             lr_start=lr_start,
         )
 
@@ -85,17 +103,18 @@ def get_constant_schedule_with_warmup(
     lr_start: float = 0.0,
 ):
     """
-    Creates a schedule with a constant learning rate preceded by a warmup period during which the learning rate
-    increases linearly between 0 and the initial lr set in the optimizer.
+    Creates a schedule with a constant learning rate preceded by a linear warmup period
+    without wasting step 0 at lr=0.
     """
 
     def _lr_lambda(current_step: int):
         if current_step < num_warmup_steps:
-            return (lr_start + (init_lr - lr_start) * current_step / max(1, num_warmup_steps)) / init_lr
+            return (lr_start + (init_lr - lr_start) * (current_step + 1) / max(1, num_warmup_steps)) / init_lr
 
         return 1.0
 
     return LambdaLR(optimizer, _lr_lambda, last_epoch=last_epoch)
+
 
 def get_two_stage_constant_schedule_with_warmup(
     optimizer,
@@ -107,12 +126,12 @@ def get_two_stage_constant_schedule_with_warmup(
     lr_start: float = 0.0,
 ):
     """
-    Two stages constant learning rate schedule with warm up follows OpenVLA-OFT.
-    Defaultly, the learning rate is 0.0 for the first 100 steps and then decay to 0.2 * init_lr after 10_000 steps.
+    Two-stage constant learning rate schedule with warmup following OpenVLA-OFT.
     """
+
     def _lr_lambda(current_step: int):
         if current_step < num_warmup_steps:
-            warmup_lr = lr_start + (init_lr - lr_start) * (current_step / max(1, num_warmup_steps))
+            warmup_lr = lr_start + (init_lr - lr_start) * ((current_step + 1) / max(1, num_warmup_steps))
             return warmup_lr / init_lr
 
         if current_step >= decay_steps:
@@ -133,13 +152,13 @@ def get_linear_schedule_with_warmup(
     lr_start: float = 0.0,
 ):
     """
-    Creates a schedule with a learning rate that decreases linearly from the initial lr set in the optimizer to 0,
-    after a warmup period during which it increases linearly from 0 to the initial lr set in the optimizer.
+    Creates a schedule with a learning rate that decreases linearly from init_lr to min_lr
+    after a linear warmup period.
     """
 
     def _lr_lambda(current_step: int):
         if current_step < num_warmup_steps:
-            return (lr_start + (init_lr - lr_start) * current_step / max(1, num_warmup_steps)) / init_lr
+            return (lr_start + (init_lr - lr_start) * (current_step + 1) / max(1, num_warmup_steps)) / init_lr
 
         min_lr_ratio = min_lr / init_lr
         return max(
@@ -147,7 +166,7 @@ def get_linear_schedule_with_warmup(
             float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps)),
         )
 
-    return LambdaLR(optimizer, _lr_lambda, last_epoch)
+    return LambdaLR(optimizer, _lr_lambda, last_epoch=last_epoch)
 
 
 def get_cosine_schedule_with_warmup(
@@ -162,24 +181,23 @@ def get_cosine_schedule_with_warmup(
     lr_start: float = 0.0,
 ):
     """
-    Creates a schedule with a learning rate that decreases following the values of the cosine function between
-    the initial lr set in the optimizer to min_lr, after a warmup period during which it increases linearly between 0
-    and the initial lr set in the optimizer.
+    Creates a schedule with a learning rate that decreases following a cosine curve from
+    init_lr to min_lr after a linear warmup period.
     """
 
     def lr_lambda(current_step: int):
         lr_decay_steps = int(num_training_steps * lr_decay_ratio)
         if current_step < num_warmup_steps:
-            return (lr_start + (init_lr - lr_start) * current_step / max(1, num_warmup_steps)) / init_lr
+            return (lr_start + (init_lr - lr_start) * (current_step + 1) / max(1, num_warmup_steps)) / init_lr
 
         min_lr_ratio = min_lr / init_lr
-        if current_step > lr_decay_steps:
+        if current_step >= lr_decay_steps:
             return min_lr_ratio
 
         progress = float(current_step - num_warmup_steps) / float(max(1, lr_decay_steps - num_warmup_steps))
-        assert 0 <= progress <= 1
+        progress = min(1.0, max(0.0, progress))
         factor = 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))
         factor = factor * (1 - min_lr_ratio) + min_lr_ratio
-        return max(0, factor)
+        return max(0.0, factor)
 
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
+    return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)

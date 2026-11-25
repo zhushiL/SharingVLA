@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -37,16 +38,29 @@ def main():
         type=str,
         required=True,
         help=(
-            "Standalone hf_ckpt directory containing VLA weights, "
-            "configs, the vlm_backbone processor/tokenizer bundle, "
-            "normalization statistics, robot configs, and vla_cli.yaml."
+            "Exported hf_ckpt or standalone action_policy directory with weights and deployment assets."
         ),
     )
 
     parser.add_argument(
         "--host",
-        default="0.0.0.0",
-        help="WebSocket bind address (use 127.0.0.1 for local-only access)",
+        default="127.0.0.1",
+        help="WebSocket bind address (defaults to 127.0.0.1; pass 0.0.0.0 explicitly to expose on LAN)",
+    )
+
+    parser.add_argument(
+        "--api_key",
+        "--api-key",
+        default=os.environ.get("POLICY_API_KEY"),
+        help="Optional API key required in the Authorization: Api-Key <key> header",
+    )
+
+    parser.add_argument(
+        "--max_size_mb",
+        "--max-size-mb",
+        type=int,
+        default=64,
+        help="Maximum WebSocket message size in MiB (default: 64)",
     )
 
     parser.add_argument(
@@ -113,6 +127,8 @@ def main():
         host=args.host,
         port=args.port,
         metadata=model.get_metadata(),
+        api_key=args.api_key,
+        max_size=args.max_size_mb * 1024 * 1024 if args.max_size_mb > 0 else None,
     )
     model_server.serve_forever()
 

@@ -8,15 +8,16 @@ __all__ = [
 ]
 
 def quat_normalize(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Normalize quaternion in xyzw format. Shape: (..., 4)."""
-    norm = torch.linalg.vector_norm(q, dim=-1, keepdim=True).clamp_min(eps)
-    return q / norm
+    """Normalize quaternion in xyzw format, falling back to identity [0,0,0,1] on near-zero inputs."""
+    norm = torch.linalg.vector_norm(q, dim=-1, keepdim=True)
+    identity = torch.zeros_like(q)
+    identity[..., 3] = 1.0
+    return torch.where(norm > eps, q / norm.clamp_min(eps), identity)
 
 
 def quat_canonicalize(q: torch.Tensor) -> torch.Tensor:
-    """Flip quaternion sign so the scalar part keeps a stable non-negative sign."""
-    sign = torch.where(q[..., 3:4] < 0, -1.0, 1.0)
-    return q * sign
+    """Flip quaternion sign so the scalar part keeps a stable non-negative sign without upcasting dtype."""
+    return torch.where(q[..., 3:4] < 0, -q, q)
 
 
 def quat_inverse(q: torch.Tensor) -> torch.Tensor:

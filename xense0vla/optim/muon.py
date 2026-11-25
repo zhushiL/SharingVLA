@@ -68,6 +68,9 @@ _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
     "embedding",
     "lm_head",
     "output_layer",
+    "action_in_projection",
+    "action_out_projection",
+    "time_projection",
 )
 
 _MEGABATCH_MAX_GROUP_SIZE = 32
@@ -215,15 +218,22 @@ def _classify_param(p: Tensor) -> str:
 
 
 def _get_dtensor_shard_info(p: DTensor) -> Tuple[Any, int, int, int]:
-    """Extract (process_group, world_size, rank, shard_dim) from a sharded DTensor."""
+    """Extract (process_group, world_size, rank, shard_dim) from a 1D-sharded DTensor."""
     mesh = p.device_mesh
-    for mesh_dim_idx, placement in enumerate(p.placements):
-        if isinstance(placement, Shard):
-            pg = mesh.get_group(mesh_dim_idx)
-            ws = mesh.size(mesh_dim_idx)
-            rk = mesh.get_local_rank(mesh_dim_idx)
-            return pg, ws, rk, placement.dim
-    raise ValueError(f"No Shard placement found in DTensor with placements={p.placements}")
+    shard_entries = [
+        (mesh_dim_idx, placement)
+        for mesh_dim_idx, placement in enumerate(p.placements)
+        if isinstance(placement, Shard)
+    ]
+    if len(shard_entries) != 1:
+        raise ValueError(
+            f"DistributedMuon requires exactly one Shard placement, got placements={p.placements}"
+        )
+    mesh_dim_idx, placement = shard_entries[0]
+    pg = mesh.get_group(mesh_dim_idx)
+    ws = mesh.size(mesh_dim_idx)
+    rk = mesh.get_local_rank(mesh_dim_idx)
+    return pg, ws, rk, placement.dim
 
 
 class DistributedMuon(Optimizer):
@@ -318,7 +328,9 @@ class DistributedMuon(Optimizer):
                 kind = _classify_param(p)
                 if kind == _KIND_FSDP_GATHER_2D:
                     global_shape = tuple(p.shape)  # DTensor .shape = global, same on all ranks
-                    key = (global_shape, str(p.dtype))
+                    placements_key = tuple(repr(pl) for pl in p.placements)
+                    mesh_key = (tuple(p.device_mesh.shape), tuple(p.device_mesh.mesh_dim_names or ()), id(p.device_mesh))
+                    key = (global_shape, str(p.dtype), placements_key, mesh_key)
                     fsdp_2d_groups[key].append(p)
                 else:
                     if p.grad is None:

@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Any, Dict, List
 
@@ -10,17 +11,16 @@ import wandb
 from tqdm import trange
 
 from xense0vla.checkpoint import build_checkpointer
-from xense0vla.data import (
-    PolicyDataCollator,
-    build_dataloader,
-    build_vla_dataset,
-)
+from xense0vla.data.data_collator import PolicyDataCollator
+from xense0vla.data.data_loader import build_dataloader
+from xense0vla.data.dataset import build_vla_dataset
 from xense0vla.distributed.offloading import build_activation_offloading_context
 from xense0vla.distributed.parallel_state import get_parallel_state, init_parallel_state
 from xense0vla.distributed.torch_parallelize import build_parallelize_model
 from xense0vla.models import save_model_assets
+from xense0vla.models.policy_utils import action_joint_mask, sample_clean_prefix
 from xense0vla.optim import build_lr_scheduler, build_muon_optimizer, build_optimizer
-from xense0vla.training.checkpoint import TrainingCheckpoint
+from xense0vla.training.checkpoint import TrainingCheckpoint, build_for_resume, find_resume_checkpoints
 from xense0vla.training.runtime import (
     _cuda_stage_end,
     _cuda_stage_start,
@@ -29,10 +29,56 @@ from xense0vla.training.runtime import (
 from xense0vla.utils import helper
 from xense0vla.utils.arguments import parse_args, save_args
 from xense0vla.utils.async_tb_writer import AsyncTBWriter
-from xense0vla.utils.dist_utils import all_reduce
 
 
 logger = helper.create_logger(__name__)
+
+
+def _micro_batch_size(micro_batch: Dict[str, Any]) -> int:
+    for preferred_key in ("actions", "wrist_images"):
+        value = micro_batch.get(preferred_key)
+        if torch.is_tensor(value) and value.ndim >= 1:
+            return int(value.shape[0])
+    for value in micro_batch.values():
+        if torch.is_tensor(value) and value.ndim >= 1:
+            return int(value.shape[0])
+    return 1
+
+
+def _micro_batch_weights(micro_batches: List[Dict[str, Any]]) -> List[float]:
+    if not micro_batches:
+        return []
+    sizes = [_micro_batch_size(mb) for mb in micro_batches]
+    total = sum(sizes)
+    if total <= 0:
+        return [1.0 / len(micro_batches)] * len(micro_batches)
+    return [size / total for size in sizes]
+
+
+def _step_loss_weights(micro_batches, config, device, dp_group):
+    """Weight each local loss mean by its share of the step's supervised elements."""
+    dp_size = dist.get_world_size(dp_group) if dist.is_initialized() else 1
+    if dp_size == 1 and len(micro_batches) == 1:
+        return [(1.0, 1.0)]
+
+    counts = []
+    for batch in micro_batches:
+        mask = action_joint_mask(batch["actions"], batch.get("joint_mask"), config.action_dim)
+        if config.rtc_training_enabled:
+            # Sample once so the forward pass trains on exactly the targets counted here.
+            prefix = sample_clean_prefix(mask.any(dim=-1), config.rtc_max_delay_steps)
+            batch["clean_prefix"] = prefix
+            mask = mask & ~prefix[..., None]
+        action_count = mask.sum()
+        label_count = batch["subtask_masks"].bool().sum() if config.use_subtask_loss else action_count.new_zeros(())
+        counts.append(torch.stack((action_count, label_count)))
+
+    local = torch.stack(counts).to(device)
+    totals = local.sum(dim=0)
+    if dp_size > 1:
+        dist.all_reduce(totals, group=dp_group)
+    # DDP and FSDP average gradients across data-parallel ranks.
+    return local.float() * dp_size / totals.clamp_min(1)
 
 
 def train(recipe):
@@ -60,9 +106,6 @@ def train(recipe):
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
 
-    if args.train.global_rank == 0:
-        save_args(args, args.train.output_dir)
-
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode)
 
     init_parallel_state(
@@ -77,13 +120,26 @@ def train(recipe):
     )
 
     logger.info_rank0("Prepare model")
-    model = recipe.build_model(args)
+    candidates = find_resume_checkpoints(args.train)
+    if candidates:
+        model, processor = build_for_resume(args.train, candidates, standalone=recipe.name == "action_policy")
+    else:
+        model = recipe.build_model(args)
+        processor = recipe.build_processor(args)
     model_config = model.config
+    if candidates:
+        args.train.chunk_size = model_config.chunk_size
+        if hasattr(args.train, "freeze_action_policy"):
+            args.train.freeze_action_policy = model_config.freeze_action_policy
+            args.train.unfreeze_mot_layers = model_config.unfreeze_mot_layers
+    if hasattr(args.train, "history_memory"):
+        args.train.history_memory = model_config.history_memory
+        args.train.history_stride = model_config.history_stride
+    if args.train.global_rank == 0:
+        save_args(args, args.train.output_dir)
     helper.print_device_mem_info("VRAM usage after building model")
 
     logger.info_rank0("Prepare data")
-    processor = recipe.build_processor(args)
-
     if args.train.rmpad or args.train.rmpad_with_pos_ids:
         raise ValueError(
             "VLA requires regular padded batches; set both rmpad and "
@@ -94,7 +150,7 @@ def train(recipe):
         PolicyDataCollator()
     ]
     if args.data.dataloader_type == "native":
-        args.data.chunk_size = args.train.chunk_size
+        args.data.chunk_size = model_config.chunk_size
         train_dataset = build_vla_dataset(
             dataset_config=args.data,
             model_config=args.model,
@@ -106,6 +162,7 @@ def train(recipe):
             args.data.max_seq_len,
             args.data.train_size,
             len(train_dataset),
+            drop_last=args.data.drop_last,
         )
 
         train_dataloader = build_dataloader(
@@ -141,6 +198,12 @@ def train(recipe):
         vlm_fsdp=getattr(args.train, "vlm_fsdp", False),
     )
     logger.info_rank0(model)
+    # Diverge per-rank RNG after model initialization/sync so each DP rank
+    # draws independent flow-matching noise, Beta timesteps, and RTC delays.
+    helper.set_seed(
+        args.train.seed + get_parallel_state().global_rank,
+        args.train.enable_full_determinism,
+    )
     if args.train.use_compile:
         model = torch.compile(model)
 
@@ -174,7 +237,7 @@ def train(recipe):
             fused=args.train.fused_optimizer,
             optimizer_type=args.train.optimizer,
             vlm_lr=getattr(args.train, "vlm_lr", None),
-            action_policy_lr=args.train.action_policy_lr,
+            spatial_encoder_lr=getattr(args.train, "spatial_encoder_lr", None),
         )
 
     total_train_steps = args.train.train_steps * args.train.num_train_epochs
@@ -191,7 +254,7 @@ def train(recipe):
         lr_start=args.train.lr_start,
     )
 
-    model_assets = [model_config, processor]
+    model_assets = [model_config] if processor is None else [model_config, processor]
     writer = None
     if args.train.global_rank == 0:
         log_dir=f"{args.train.output_dir}/runs/"
@@ -224,7 +287,9 @@ def train(recipe):
         train_dataloader=train_dataloader,
         model_assets=model_assets, writer=writer, checkpointer=Checkpointer,
     )
-    start_epoch, start_step, global_step = checkpoints.restore()
+    start_epoch, start_step, global_step = checkpoints.restore(candidates)
+    if checkpoints.is_saved_in_output_dir(global_step):
+        last_saved_step = global_step
 
     helper.empty_cache()
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
@@ -237,7 +302,13 @@ def train(recipe):
     )
     if args.train.global_rank == 0:
         os.makedirs(args.train.save_checkpoint_path, exist_ok=True)
-    reached_max_steps = False
+    reached_max_steps = (
+        args.train.max_steps is not None and global_step >= args.train.max_steps
+    )
+    if reached_max_steps:
+        logger.info_rank0(
+            f"Resumed checkpoint is already at global_step={global_step} >= max_steps={args.train.max_steps}; skipping training loop."
+        )
     max_steps_driven = (
         args.train.max_steps is not None
         and args.train.max_steps < args.train.train_steps * args.train.num_train_epochs
@@ -249,7 +320,16 @@ def train(recipe):
             initial=global_step,
             disable=args.train.local_rank != 0,
         )
+    dp_group = get_parallel_state().dp_group
+    fsdp_group = get_parallel_state().fsdp_group
+    dp_reduce_denom = (
+        dist.get_world_size(group=fsdp_group)
+        if dist.is_initialized() and fsdp_group is not None
+        else 1
+    )
     for epoch in range(start_epoch, args.train.num_train_epochs):
+        if reached_max_steps:
+            break
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
 
@@ -263,30 +343,26 @@ def train(recipe):
             )
         data_iterator = iter(train_dataloader)
         for epoch_step in range(start_step, args.train.train_steps):
-            global_step += 1
             iteration_start_time = time.perf_counter()
             try:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
             except StopIteration:
                 logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
                 break
+            global_step += 1
             data_wait_time = time.perf_counter() - iteration_start_time
 
             if global_step == 1:
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
-            total_loss = 0.0
-            total_action_loss = 0.0
-            total_language_loss = 0.0
-            total_metrics: Dict[str, float] = {}
-            avg_lang_length = 0.0
-            torch.cuda.synchronize()
-            torch.cuda.reset_peak_memory_stats()
-            start_time = time.time()
             should_log_performance = (
                 args.train.performance_log_steps > 0
                 and global_step % args.train.performance_log_steps == 0
             )
+            if should_log_performance:
+                torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            start_time = time.perf_counter()
             stage_names = [
                 "h2d",
                 "model_forward",
@@ -298,8 +374,17 @@ def train(recipe):
             stage_events: Dict[
                 str, List[tuple[torch.cuda.Event, torch.cuda.Event]]
             ] = {}
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            total_loss_t = torch.zeros((), dtype=torch.float32, device=device)
+            total_action_loss_t = torch.zeros((), dtype=torch.float32, device=device)
+            total_language_loss_t = torch.zeros((), dtype=torch.float32, device=device)
+            avg_lang_length_t = torch.zeros((), dtype=torch.float32, device=device)
+            total_metrics_t: Dict[str, torch.Tensor] = {}
             num_micro_batches = len(micro_batches)
-            for micro_batch in micro_batches:
+            mb_weights = _micro_batch_weights(micro_batches)
+            loss_weights = _step_loss_weights(micro_batches, model_config, device, dp_group)
+            for mb_idx, (micro_batch, mb_weight) in enumerate(zip(micro_batches, mb_weights)):
+                is_last_micro_batch = mb_idx == num_micro_batches - 1
                 micro_batch.pop("rep_id", None)
                 _cuda_stage_start(stage_events, "h2d", should_log_performance)
                 micro_batch = {
@@ -308,52 +393,74 @@ def train(recipe):
                 }
                 _cuda_stage_end(stage_events, "h2d", should_log_performance)
 
+                # Suppress intermediate all-reduce/reduce-scatter during gradient accumulation.
+                if num_micro_batches > 1 and hasattr(model, "set_requires_gradient_sync"):
+                    model.set_requires_gradient_sync(is_last_micro_batch)
+                sync_context = (
+                    model.no_sync()
+                    if (
+                        num_micro_batches > 1
+                        and not is_last_micro_batch
+                        and not hasattr(model, "set_requires_gradient_sync")
+                        and hasattr(model, "no_sync")
+                    )
+                    else nullcontext()
+                )
+
                 # FSDP applies module-level mixed precision when sharding is
                 # active; autocast also covers unwrapped MoT paths and the
                 # single-GPU case where FSDP is intentionally disabled.
-                _cuda_stage_start(
-                    stage_events, "model_forward", should_log_performance
-                )
-                with model_fwd_context, torch.autocast("cuda", dtype=torch.bfloat16):
-                    (
-                        loss,
-                        action_loss,
-                        language_loss,
-                        loss_dict,
-                        _,
-                    ) = recipe.forward(model, micro_batch)
-                    loss = loss / num_micro_batches
-                    action_loss = action_loss / num_micro_batches
-                    language_loss = language_loss / num_micro_batches
-                    if "lang_masks" in micro_batch:
-                        avg_lang_length += (
-                            micro_batch["lang_masks"].sum(dim=-1).float().mean().item()
-                            / num_micro_batches
+                with sync_context:
+                    _cuda_stage_start(
+                        stage_events, "model_forward", should_log_performance
+                    )
+                    with model_fwd_context, torch.autocast("cuda", dtype=torch.bfloat16):
+                        (
+                            _,
+                            action_loss,
+                            language_loss,
+                            loss_dict,
+                            _,
+                        ) = recipe.forward(model, micro_batch)
+                        action_weight, language_weight = loss_weights[mb_idx]
+                        action_loss = action_loss * action_weight
+                        language_loss = language_loss * language_weight
+                        loss = (
+                            model_config.action_loss_weight * action_loss
+                            + model_config.language_loss_weight * language_loss
                         )
-                _cuda_stage_end(
-                    stage_events, "model_forward", should_log_performance
-                )
+                        if "lang_masks" in micro_batch:
+                            avg_lang_length_t = avg_lang_length_t + (
+                                micro_batch["lang_masks"].sum(dim=-1).float().mean().detach()
+                                * mb_weight
+                            )
+                    _cuda_stage_end(
+                        stage_events, "model_forward", should_log_performance
+                    )
 
-                _cuda_stage_start(stage_events, "backward", should_log_performance)
-                with model_bwd_context:
-                    loss.backward()
-                _cuda_stage_end(stage_events, "backward", should_log_performance)
+                    _cuda_stage_start(stage_events, "backward", should_log_performance)
+                    with model_bwd_context:
+                        loss.backward()
+                    _cuda_stage_end(stage_events, "backward", should_log_performance)
 
-                total_loss += loss.item()
-                total_action_loss += action_loss.item()
-                total_language_loss += language_loss.item()
+                total_loss_t = total_loss_t + loss.detach().float()
+                total_action_loss_t = total_action_loss_t + action_loss.detach().float()
+                total_language_loss_t = total_language_loss_t + language_loss.detach().float()
                 for key, value in loss_dict.items():
+                    if key == "batch_mean_losses":
+                        continue
                     if torch.is_tensor(value):
-                        if value.numel() != 1:
+                        if value.ndim != 0 and value.numel() != 1:
                             continue
-                        scalar = value.detach().float().item()
+                        scalar_t = value.detach().float().reshape(())
                     elif isinstance(value, (int, float)):
-                        scalar = float(value)
+                        scalar_t = torch.tensor(float(value), dtype=torch.float32, device=device)
                     else:
                         continue
-                    total_metrics[key] = (
-                        total_metrics.get(key, 0.0) + scalar / num_micro_batches
-                    )
+                    if key in total_metrics_t:
+                        total_metrics_t[key] = total_metrics_t[key] + scalar_t * mb_weight
+                    else:
+                        total_metrics_t[key] = scalar_t * mb_weight
 
                 del micro_batch
 
@@ -363,34 +470,42 @@ def train(recipe):
                 max_grad_norm = args.train.max_grad_norm
             _cuda_stage_start(stage_events, "grad_clip", should_log_performance)
             if args.train.data_parallel_mode == "fsdp1":
-                grad_norm = model.clip_grad_norm_(max_grad_norm).item()
+                grad_norm = model.clip_grad_norm_(max_grad_norm)
             else:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm, foreach=True)
             _cuda_stage_end(stage_events, "grad_clip", should_log_performance)
 
+            # Read the LR actually used for this optimizer step before advancing the scheduler.
+            lr = max(lr_scheduler.get_last_lr())
             _cuda_stage_start(stage_events, "optimizer", should_log_performance)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
             _cuda_stage_end(stage_events, "optimizer", should_log_performance)
-            if hasattr(grad_norm, "full_tensor"):
-                grad_norm = grad_norm.full_tensor().item()
-            elif torch.is_tensor(grad_norm):
-                grad_norm = grad_norm.item()
 
-            metric_keys = sorted(total_metrics)
+            if hasattr(grad_norm, "full_tensor"):
+                grad_norm_t = grad_norm.full_tensor().detach().float().reshape(())
+            elif torch.is_tensor(grad_norm):
+                grad_norm_t = grad_norm.detach().float().reshape(())
+            else:
+                grad_norm_t = torch.tensor(float(grad_norm), dtype=torch.float32, device=device)
+
+            metric_keys = sorted(total_metrics_t)
             _cuda_stage_start(stage_events, "metric_reduce", should_log_performance)
-            reduced_values = all_reduce(
+            packed_metrics = torch.stack(
                 [
-                    total_loss,
-                    total_action_loss,
-                    total_language_loss,
-                    avg_lang_length,
-                    grad_norm,
-                    *(total_metrics[key] for key in metric_keys),
-                ],
-                group=get_parallel_state().fsdp_group,
+                    total_loss_t,
+                    total_action_loss_t,
+                    total_language_loss_t,
+                    avg_lang_length_t,
+                    grad_norm_t,
+                    *(total_metrics_t[key] for key in metric_keys),
+                ]
             )
+            if dist.is_initialized() and fsdp_group is not None:
+                dist.all_reduce(packed_metrics, op=dist.ReduceOp.SUM, group=fsdp_group)
+                packed_metrics.div_(dp_reduce_denom)
+            reduced_values = packed_metrics.tolist()
             _cuda_stage_end(stage_events, "metric_reduce", should_log_performance)
             (
                 total_loss,
@@ -402,12 +517,12 @@ def train(recipe):
             ) = reduced_values
             total_metrics = dict(zip(metric_keys, metric_values))
 
-            torch.cuda.synchronize()
-            delta_time = time.time() - start_time
+            if should_log_performance:
+                torch.cuda.synchronize()
+            delta_time = time.perf_counter() - start_time
             iteration_time = time.perf_counter() - iteration_start_time
             peak_allocated_gib = torch.cuda.max_memory_allocated() / 1024**3
             peak_reserved_gib = torch.cuda.max_memory_reserved() / 1024**3
-            lr = max(lr_scheduler.get_last_lr())
             data_loader_tqdm.update()
             metrics_str = "".join(
                 f"{key} {value:.4f}, " for key, value in total_metrics.items()
@@ -499,9 +614,12 @@ def train(recipe):
                     profiler.step()
                     if global_step == args.train.profile_end_step:
                         profiler.stop()
-                        helper.upload_trace(
-                            args.train.wandb_project, args.train.wandb_name, args.train.profile_trace_dir
+                        logger.info_rank0(
+                            f"Profiling trace written to {args.train.profile_trace_dir}."
                         )
+
+            if args.train.empty_cache_steps > 0 and global_step % args.train.empty_cache_steps == 0:
+                helper.empty_cache()
 
             if args.train.save_steps and global_step % args.train.save_steps == 0:
                 checkpoints.save(global_step)
@@ -531,8 +649,20 @@ def train(recipe):
             checkpoints.save(global_step)
             last_saved_step = global_step
 
-    if last_saved_step != global_step and global_step > 0:
-        checkpoints.save(global_step)
+    if global_step > 0:
+        if last_saved_step != global_step:
+            checkpoints.save(global_step)
+            last_saved_step = global_step
+        elif not checkpoints.has_complete_export(global_step):
+            checkpoint_path = os.path.join(
+                args.train.save_checkpoint_path,
+                f"global_step_{global_step}",
+            )
+            logger.info_rank0(
+                f"Final DCP at {checkpoint_path} is missing a complete hf_ckpt export; "
+                "re-exporting deployment weights from DCP."
+            )
+            checkpoints.export_deployment_checkpoint(checkpoint_path)
     if max_steps_driven:
         data_loader_tqdm.close()
     if args.train.global_rank == 0:

@@ -50,6 +50,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ ! "${ENV_NAME}" =~ ^[A-Za-z0-9._-]+$ || "${ENV_NAME}" == "." || "${ENV_NAME}" == ".." ]]; then
+  echo "Invalid --env-name: '${ENV_NAME}'. Only [A-Za-z0-9._-] without path separators are allowed." >&2
+  exit 2
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}"
 
@@ -86,7 +91,9 @@ fi
 if [[ "${RESUME}" != "1" || "${ENV_EXISTS}" != "1" ]]; then
   conda create -n "${ENV_NAME}" python=3.12 pip -y
 fi
+set +u
 conda activate "${ENV_NAME}"
+set -u
 
 # TorchCodec dynamically links against FFmpeg's shared libraries. Pin FFmpeg 7
 # because the torchcodec 0.6.0 wheels below provide adapters for FFmpeg 4-7.
@@ -132,6 +139,11 @@ assert_media_stack
 
 python -m pip install -r "${REPO_ROOT}/requirements.txt"
 assert_torch_stack
+
+# The spatial_encoder uses the upstream Transformer implementation to load DA3-LARGE
+# backbone weights. Install it without the visualization, point-cloud and geometry-head dependencies.
+python -m pip install --no-deps 'depth-anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3.git@3d835ec1a5802d64a8b8b15f817a1ab54809bfe4'
+python -c 'from depth_anything_3.model.dinov2.dinov2 import DinoV2'
 
 python -m pip install numpydantic==1.9.0 --no-deps
 assert_torch_stack

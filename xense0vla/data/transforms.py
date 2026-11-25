@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from typing import Dict, Sequence
 
 import numpy as np
@@ -10,12 +11,16 @@ from xense0vla.utils import logging as logging_utils
 
 logger = logging_utils.get_logger(__name__)
 
-IMAGE_KEYS = (
-    "camera_top",
-    "camera_wrist_left",
-    "camera_wrist_right",
-)
 IGNORE_INDEX = -100
+_TOKEN_CACHE_MAX_SIZE = 4096
+_LANGUAGE_TOKEN_CACHE: OrderedDict[tuple, tuple[Tensor, Tensor]] = OrderedDict()
+_SUBTASK_TOKEN_CACHE: OrderedDict[tuple, tuple[Tensor, Tensor]] = OrderedDict()
+
+
+def _clamp_value(value, *, min_val: float, max_val: float):
+    if isinstance(value, torch.Tensor):
+        return torch.clamp(value, min=min_val, max=max_val)
+    return np.clip(value, min_val, max_val)
 
 
 def _as_debug_list(value):
@@ -43,11 +48,23 @@ class Normalizer:
         norm_stats: Dict[str, Dict[str, np.ndarray]],
         norm_type: Dict[str, str] | None = None,
     ):
-        self.norm_stats = dict_apply(lambda x: np.array(x), norm_stats)
+        self.norm_stats = {
+            key: {stat_name: np.asarray(stat_val, dtype=np.float32) for stat_name, stat_val in stats.items()}
+            for key, stats in norm_stats.items()
+        }
+        self._torch_norm_stats = {
+            key: {stat_name: torch.from_numpy(stat_val) for stat_name, stat_val in stats.items()}
+            for key, stats in self.norm_stats.items()
+        }
         self.norm_type = norm_type or {}
 
     def _get_stat(self, key: str, stat_name: str, value):
-        stat = self.norm_stats[key][stat_name]
+        if isinstance(value, torch.Tensor):
+            stat = self._torch_norm_stats[key][stat_name]
+            if stat.device != value.device or stat.dtype != torch.float32:
+                stat = stat.to(device=value.device, dtype=torch.float32)
+        else:
+            stat = self.norm_stats[key][stat_name]
 
         # Action stats may use a longer horizon than the active action chunk.
         # When training with a smaller chunk_size, align stats to the actual
@@ -74,48 +91,48 @@ class Normalizer:
         for key, value in data.items():
             if key in self.norm_stats:
                 norm_type = self.norm_type.get(key, "identity")
-                # print(f'===Normalizing with {norm_type} for {key}===')
+                val = value.float() if isinstance(value, torch.Tensor) and value.is_floating_point() else value
                 if norm_type == "meanstd":
-                    mean = self._get_stat(key, "mean", value)
-                    std = self._get_stat(key, "std", value)
-                    normalized_value = (value - mean) / (std + 1e-6)
+                    mean = self._get_stat(key, "mean", val)
+                    std = self._get_stat(key, "std", val)
+                    normalized_value = (val - mean) / (std + 1e-6)
                 elif norm_type == "bounds_98":
-                    low = self._get_stat(key, "q02", value)
-                    high = self._get_stat(key, "q98", value)
-                    normalized_value = (value - low) / (high - low + 1e-6) * 2.0 - 1.0
-                    normalized_value = torch.clamp(normalized_value, min=-1.5, max=1.5)
+                    low = self._get_stat(key, "q02", val)
+                    high = self._get_stat(key, "q98", val)
+                    normalized_value = (val - low) / (high - low + 1e-6) * 2.0 - 1.0
+                    normalized_value = _clamp_value(normalized_value, min_val=-1.5, max_val=1.5)
                 elif norm_type == "bounds_99":
-                    low = self._get_stat(key, "q01", value)
-                    high = self._get_stat(key, "q99", value)
-                    normalized_value = (value - low) / (high - low + 1e-6) * 2.0 - 1.0
-                    normalized_value = torch.clamp(normalized_value, min=-1.5, max=1.5)
+                    low = self._get_stat(key, "q01", val)
+                    high = self._get_stat(key, "q99", val)
+                    normalized_value = (val - low) / (high - low + 1e-6) * 2.0 - 1.0
+                    normalized_value = _clamp_value(normalized_value, min_val=-1.5, max_val=1.5)
                 elif norm_type == "bounds_98_woclip":
-                    low = self._get_stat(key, "q02", value)
-                    high = self._get_stat(key, "q98", value)
-                    normalized_value = (value - low) / (high - low + 1e-6) * 2.0 - 1.0
+                    low = self._get_stat(key, "q02", val)
+                    high = self._get_stat(key, "q98", val)
+                    normalized_value = (val - low) / (high - low + 1e-6) * 2.0 - 1.0
                 elif norm_type == "bounds_99_woclip":
-                    low = self._get_stat(key, "q01", value)
-                    high = self._get_stat(key, "q99", value)
-                    normalized_value = (value - low) / (high - low + 1e-6) * 2.0 - 1.0
+                    low = self._get_stat(key, "q01", val)
+                    high = self._get_stat(key, "q99", val)
+                    normalized_value = (val - low) / (high - low + 1e-6) * 2.0 - 1.0
                 elif norm_type == "std":
-                    std = self._get_stat(key, "std", value)
-                    normalized_value = value / (std + 1e-6)
+                    std = self._get_stat(key, "std", val)
+                    normalized_value = val / (std + 1e-6)
                 elif norm_type == "minmax":
-                    min_val = self._get_stat(key, "min", value)
-                    max_val = self._get_stat(key, "max", value)
-                    normalized_value = (value - min_val) / (max_val - min_val + 1e-6) * 2 - 1
-                    normalized_value = torch.clamp(normalized_value, min=-1, max=1)
+                    min_val = self._get_stat(key, "min", val)
+                    max_val = self._get_stat(key, "max", val)
+                    normalized_value = (val - min_val) / (max_val - min_val + 1e-6) * 2.0 - 1.0
+                    normalized_value = _clamp_value(normalized_value, min_val=-1.0, max_val=1.0)
                 elif norm_type == "minmax_woclip":
-                    min_val = self._get_stat(key, "min", value)
-                    max_val = self._get_stat(key, "max", value)
-                    normalized_value = (value - min_val) / (max_val - min_val + 1e-6) * 2 - 1
+                    min_val = self._get_stat(key, "min", val)
+                    max_val = self._get_stat(key, "max", val)
+                    normalized_value = (val - min_val) / (max_val - min_val + 1e-6) * 2.0 - 1.0
                 elif norm_type == "sincos":
                     if not key.startswith("observation.state."):
                         raise ValueError(f"sincos normalization is only allowed for state keys, got {key}")
-                    if isinstance(value, torch.Tensor):
-                        normalized_value = torch.cat([torch.cos(value), torch.sin(value)], dim=-1)
+                    if isinstance(val, torch.Tensor):
+                        normalized_value = torch.cat([torch.cos(val), torch.sin(val)], dim=-1)
                     else:
-                        normalized_value = np.concatenate([np.cos(value), np.sin(value)], axis=-1)
+                        normalized_value = np.concatenate([np.cos(val), np.sin(val)], axis=-1)
                 elif norm_type == "identity":
                     normalized_value = value
                 else:
@@ -321,7 +338,7 @@ def apply_visual_augmentation(
     visual: Tensor,
     params: dict,
 ) -> Tensor:
-    """Apply the same sampled crop/rotate/color params to an image or video clip.
+    """Apply the same sampled brightness, contrast and saturation to every frame.
 
     Accepts images with shape (C,H,W) and video clips with shape (T,C,H,W).
     The output keeps the input shape and dtype, so it can be reused before image
@@ -338,7 +355,7 @@ def apply_visual_augmentation(
 
     orig_dtype = visual.dtype
     image = visual_bchw.to(torch.float32)
-    if image.max() > 1.0:
+    if orig_dtype == torch.uint8 or image.max() > 1.0:
         image = image / 255.0
 
     brightness = params["brightness"].to(device=image.device, dtype=image.dtype)
@@ -358,123 +375,62 @@ def apply_visual_augmentation(
     return image.squeeze(0) if squeeze else image
 
 
-def prepare_images(
-    image_processor,
-    observation: dict[str, Tensor],
-    image_keys=None,
-    train=False,
-    return_raw_images=False,
-    return_image_grid_thw=False,
-    augment_params=None,
-    return_augment_params=False,
-):
-    """Normalize, resize, and pad images and stack them into a tensor.
+def history_offsets(memory: int, stride: int) -> list[int]:
+    """Frame offsets from oldest history to current observation (inclusive)."""
+    if type(memory) is not int or memory < 0 or type(stride) is not int or stride < 1:
+        raise ValueError("history_memory must be a non-negative integer and history_stride a positive integer.")
+    return list(range(-memory * stride, 1, stride))
 
-    Args:
-        observation (dict[str, Tensor])
 
-    Returns:
-        images (torch.Tensor): (*b, n, c, h, w) images in range [-1.0, 1.0]
-        img_masks (torch.Tensor): (*b, n) masks for images, True if image is present, False if missing
-    """
-    dtype = observation["state"].dtype  # fp32
-    images, img_masks = [], []
-    image_grid_thw_list = []
-    image_dict = {}
-    image_grid_thw_dict = {}
-    image_keys = image_keys if image_keys is not None else IMAGE_KEYS
-    if not image_keys:
-        raise ValueError("At least one model camera is required.")
-    if train:
-        for key in image_keys:
-            if key in observation["image"]:
-                if augment_params is None:
-                    augment_params = sample_visual_augmentation_params(observation["image"][key])
-                break
+def resize_rgb_uint8(visual: Tensor, size: int) -> Tensor:
+    visual = canonicalize_visual(visual)
+    if visual.shape[-3] != 3:
+        raise ValueError(f"Expected an RGB camera observation, got {tuple(visual.shape)}.")
+    if visual.is_floating_point():
+        # Detect [0,1] vs [0,255] BEFORE bilinear+antialias interpolation, which
+        # can slightly overshoot 1.0 (e.g. 1.0000001) on bright pixels.
+        is_unit_scale = bool(visual.numel() > 0 and visual.amax() <= 1.0 + 1e-3)
+        visual = resize_visual(visual, size)
+        if is_unit_scale:
+            visual = visual.clamp(0.0, 1.0) * 255.0
+        return visual.round().clamp(0, 255).to(torch.uint8)
+    if visual.dtype != torch.uint8:
+        raise ValueError(f"Expected uint8 or floating point RGB, got {visual.dtype}.")
+    return resize_visual(visual, size)
 
-    if return_raw_images:
-        raw_images = []
-        raw_image_dict = {}
 
-    for key in image_keys:
-        if key not in observation["image"]:
-            continue
-        img = observation["image"][key]
-        assert img.ndim == 3, f"Expected 3D image, got {img.shape}"
-        if train:
-            if augment_params is None:
-                augment_params = sample_visual_augmentation_params(img)
+def prepare_images(item, wrist_keys, head_key, config, processor, *, augment=False, return_raw=False):
+    """Prepare the wrist pair for the spatial_encoder and optional head images for Qwen."""
+    wrists = torch.stack([resize_rgb_uint8(item[key], config.wrist_image_size) for key in wrist_keys])
+    if wrists.ndim != 4 or wrists.shape[0] != 2:
+        raise ValueError("Expected two current wrist images ordered left, right.")
+    params = sample_visual_augmentation_params(wrists) if augment else None
+    if params is not None:
+        wrists = apply_visual_augmentation(wrists, params)
+    pixels = wrists.float().div_(255)
+    mean = pixels.new_tensor(config.wrist_image_mean).view(3, 1, 1)
+    std = pixels.new_tensor(config.wrist_image_std).view(3, 1, 1)
+    result = {"wrist_images": (pixels - mean) / std}
+    if return_raw:
+        result["raw_wrist_images"] = wrists
 
-            img = apply_visual_augmentation(
-                img,
-                augment_params,
-            )
-
-        if return_raw_images:
-            raw_image_dict[key] = img.detach().cpu()
-
-        if image_processor is None:
-            img = img.to(dtype) / 127.5 - 1.0  # to [-1, 1]
-        else:
-            processed = image_processor(img)
-            # Qwen3.5 returns flattened spatiotemporal patches.
-            img = processed["pixel_values"]
-            if return_image_grid_thw and "image_grid_thw" in processed:
-                image_grid_thw_dict[key] = processed["image_grid_thw"]
-        image_dict[key] = img
-
-    if not image_dict:
-        raise ValueError(f"None of the configured model cameras are present: {list(image_keys)}")
-
-    for key in image_keys:
-        if key in image_dict:
-            img = image_dict[key]
-            images.append(img)
-            img_masks.append(True)
-            if return_image_grid_thw:
-                image_grid_thw_list.append(image_grid_thw_dict[key])
-            if return_raw_images:
-                raw_images.append(raw_image_dict[key])
-        else:
-            # zero padding
-            img = image_dict[list(image_dict.keys())[0]]
-            if isinstance(img, torch.Tensor):
-                img = torch.zeros_like(img)
-            else:
-                img = np.zeros_like(img)
-            images.append(img)
-            if return_image_grid_thw:
-                image_grid_thw_list.append(image_grid_thw_dict.get(list(image_dict.keys())[0], None))
-            if return_raw_images:
-                raw_images.append(torch.zeros_like(raw_image_dict[list(raw_image_dict.keys())[0]]))
-            img_masks.append(False)
-
-    if isinstance(images[0], torch.Tensor):
-        images = torch.stack(images, dim=0)  # (n, c, h, w)
-    elif isinstance(images[0], np.ndarray):
-        images = torch.from_numpy(np.stack(images, axis=0))  # (n, c, h, w)
-    img_masks = torch.tensor(img_masks, dtype=torch.bool)  # (*n)
-
-    if return_raw_images:
-        raw_images = torch.stack(raw_images, dim=0)  # (n, c, h, w)
-    else:
-        raw_images = None
-
-    if return_image_grid_thw:
-        image_grid_thw = []
-        for grid_thw in image_grid_thw_list:
-            if grid_thw is None:
-                raise ValueError("return_image_grid_thw=True requires image_processor to return image_grid_thw.")
-            if not isinstance(grid_thw, torch.Tensor):
-                grid_thw = torch.as_tensor(grid_thw)
-            image_grid_thw.append(grid_thw.reshape(-1, 3)[0])
-        image_grid_thw = torch.stack(image_grid_thw, dim=0).to(dtype=torch.long)
-    else:
-        image_grid_thw = None
-
-    if return_augment_params:
-        return images, img_masks, raw_images, image_grid_thw, augment_params
-    return images, img_masks, raw_images, image_grid_thw
+    if head_key is not None:
+        head = resize_rgb_uint8(item[head_key], config.head_image_size)
+        # Video and embedded image backends can differ on the singleton time axis.
+        if head.ndim == 3:
+            head = head.unsqueeze(0)
+        count = config.history_memory + 1
+        if head.shape[0] != count:
+            raise ValueError(f"Expected {count} chronological head frames, got {head.shape[0]}.")
+        if params is not None:
+            head = apply_visual_augmentation(head, params)
+        processed = processor.image_processor(images=list(head.unbind()), do_resize=False, return_tensors="pt")
+        patches = processed["pixel_values"]
+        result["head_images"] = patches.reshape(count, -1, patches.shape[-1])
+        result["image_grid_thw"] = processed["image_grid_thw"].reshape(count, 3)
+        if return_raw:
+            result["raw_head_images"] = head
+    return result
 
 
 def prepare_state(observation: dict[str, Tensor], max_state_dim):
@@ -526,9 +482,16 @@ def prepare_language(config, language_tokenizer, observation: dict[str, Tensor])
     if prompt is None and (lang_tokens is None or lang_masks is None):
         raise ValueError("Either 'prompt' or ('lang_tokens', 'lang_masks') must be provided in the observation.")
 
-    device = observation["state"].device
     if prompt is not None and (lang_tokens is None or lang_masks is None):
-        prompt = [
+        max_length = int(config.tokenizer_max_length)
+        cache_key = None
+        if isinstance(prompt, (list, tuple)) and len(prompt) == 1 and isinstance(prompt[0], str):
+            cache_key = (id(language_tokenizer), max_length, prompt[0])
+            cached = _LANGUAGE_TOKEN_CACHE.get(cache_key)
+            if cached is not None:
+                _LANGUAGE_TOKEN_CACHE.move_to_end(cache_key)
+                return cached[0].clone(), cached[1].clone()
+        formatted_prompt = [
             language_tokenizer.apply_chat_template(
                 [{"role": "user", "content": p}],
                 tokenize=False,
@@ -536,22 +499,25 @@ def prepare_language(config, language_tokenizer, observation: dict[str, Tensor])
             )
             for p in prompt
         ]
-        # print(prompt)
-        tokenized_prompt = language_tokenizer.__call__(
-            prompt,
+        tokenized_prompt = language_tokenizer(
+            formatted_prompt,
             padding="max_length",
             padding_side="right",
-            max_length=config.tokenizer_max_length,
+            max_length=max_length,
             truncation=True,
             return_tensors="pt",
         )
-        lang_tokens = tokenized_prompt["input_ids"].to(device=device)
-        lang_masks = tokenized_prompt["attention_mask"].to(device=device, dtype=torch.bool)
-    else:
-        lang_tokens = observation["lang_tokens"].to(device=device)
-        lang_masks = observation["lang_masks"].to(device=device, dtype=torch.bool)
+        lang_tokens = tokenized_prompt["input_ids"]
+        lang_masks = tokenized_prompt["attention_mask"]
+        out_tokens = lang_tokens.squeeze(0)
+        out_masks = lang_masks.to(device=lang_tokens.device, dtype=torch.bool).squeeze(0)
+        if cache_key is not None:
+            _LANGUAGE_TOKEN_CACHE[cache_key] = (out_tokens.clone(), out_masks.clone())
+            if len(_LANGUAGE_TOKEN_CACHE) > _TOKEN_CACHE_MAX_SIZE:
+                _LANGUAGE_TOKEN_CACHE.popitem(last=False)
+        return out_tokens, out_masks
 
-    return lang_tokens.squeeze(0), lang_masks.squeeze(0)
+    return lang_tokens.squeeze(0), lang_masks.to(device=lang_tokens.device, dtype=torch.bool).squeeze(0)
 
 
 def prepare_subtask(config, language_tokenizer, subtask):
@@ -569,17 +535,25 @@ def prepare_subtask(config, language_tokenizer, subtask):
         raise ValueError("The language tokenizer must define EOS and padding tokens.")
     if length < 1:
         raise ValueError("subtask_max_length must be positive.")
-    tokens = torch.full((length,), pad, dtype=torch.long)
-    mask = torch.zeros(length, dtype=torch.bool)
     # Missing labels retain action supervision without contributing an EOS target.
     if subtask is None or (isinstance(subtask, str) and not subtask.strip()):
-        return tokens, mask
+        return torch.full((length,), pad, dtype=torch.long), torch.zeros(length, dtype=torch.bool)
     if not isinstance(subtask, str):
         raise TypeError("A subtask annotation must be a string or None.")
+    cache_key = (id(language_tokenizer), length, eos, pad, subtask)
+    cached = _SUBTASK_TOKEN_CACHE.get(cache_key)
+    if cached is not None:
+        _SUBTASK_TOKEN_CACHE.move_to_end(cache_key)
+        return cached[0].clone(), cached[1].clone()
+    tokens = torch.full((length,), pad, dtype=torch.long)
+    mask = torch.zeros(length, dtype=torch.bool)
     encoded = language_tokenizer(subtask, add_special_tokens=False, truncation=True, max_length=length - 1)[
         "input_ids"
     ]
     encoded = list(encoded)[: length - 1] + [eos]
     tokens[: len(encoded)] = torch.tensor(encoded, dtype=torch.long)
     mask[: len(encoded)] = True
+    _SUBTASK_TOKEN_CACHE[cache_key] = (tokens.clone(), mask.clone())
+    if len(_SUBTASK_TOKEN_CACHE) > _TOKEN_CACHE_MAX_SIZE:
+        _SUBTASK_TOKEN_CACHE.popitem(last=False)
     return tokens, mask

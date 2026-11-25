@@ -14,12 +14,19 @@
 
 
 from .auto import build_foundation_model, build_processor
-from .module_utils import init_empty_weights, load_model_weights, save_model_assets, save_model_weights
+from .module_utils import (
+    cast_model_parameters_dtype,
+    init_empty_weights,
+    load_model_weights,
+    save_model_assets,
+    save_model_weights,
+)
 
 
 __all__ = [
     "build_foundation_model",
     "build_processor",
+    "cast_model_parameters_dtype",
     "init_empty_weights",
     "load_model_weights",
     "save_model_assets",

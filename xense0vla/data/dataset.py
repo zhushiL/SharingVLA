@@ -56,7 +56,6 @@ def build_vla_dataset(
     robot_config_root = dataset_config.robot_config_root
     chunk_size = dataset_config.chunk_size
     prompt_type = getattr(dataset_config, "prompt_type", "global")
-    img_size = getattr(dataset_config, "img_size", 256)
     image_augment = bool(getattr(dataset_config, "image_augment", False))
     if data_name == "multi":
         dataset = MultiVLADataset(
@@ -66,7 +65,6 @@ def build_vla_dataset(
             config=config,
             processor=processor,
             video_backend=getattr(dataset_config, "video_backend", "torchcodec"),
-            image_size=(img_size, img_size),
             chunk_size=chunk_size,
             disabled_image_features=disabled_image_features,
             prompt_type=prompt_type,
@@ -84,7 +82,6 @@ def build_vla_dataset(
             config=config,
             processor=processor,
             video_backend=getattr(dataset_config, "video_backend", "torchcodec"),
-            image_size=(img_size, img_size),
             do_nomalize=do_nomalize,
             return_item=return_item,
             chunk_size=chunk_size,

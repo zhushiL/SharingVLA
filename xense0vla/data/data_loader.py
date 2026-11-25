@@ -13,8 +13,11 @@
 # limitations under the License.
 
 
+import random
 from typing import TYPE_CHECKING
 
+import numpy as np
+import torch
 from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
@@ -24,6 +27,13 @@ from .data_collator import CollatePipeline, MakeMicroBatchCollator, PolicyDataCo
 
 if TYPE_CHECKING:
     from torch.utils.data import Dataset
+
+
+def _seed_dataloader_worker(worker_id: int) -> None:
+    """Seed Python and NumPy RNGs uniquely per worker and rank."""
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 class DistributedDataloader(StatefulDataLoader):
@@ -69,6 +79,8 @@ def build_dataloader(
             seed=seed,
         )
     )
+    generator = torch.Generator()
+    generator.manual_seed(int(seed) + int(parallel.dp_rank) * 100003)
     return DistributedDataloader(
         dataset,
         batch_size=dataloader_batch_size,
@@ -79,4 +91,6 @@ def build_dataloader(
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor if num_workers else None,
         persistent_workers=persistent_workers if num_workers else False,
+        worker_init_fn=_seed_dataloader_worker if num_workers else None,
+        generator=generator,
     )

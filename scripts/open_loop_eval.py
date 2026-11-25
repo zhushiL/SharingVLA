@@ -5,6 +5,8 @@ import importlib
 import os
 import sys
 
+import matplotlib
+matplotlib.use("Agg")
 import numpy as np
 from matplotlib import pyplot as plt
 
@@ -45,34 +47,29 @@ def to_numpy(value):
 
 
 def prepare_eval_observation(policy, traj):
+    """Prepare native observation for policy.infer and unclipped raw ground-truth arrays."""
     traj = dict(traj)
-    for image_key in policy.vla.feature_transform.org_features['images']:
-        # Keep CHW/TCHW intact, including the explicit history/current head pair.
-        # Float video frames are in [0, 1]; casting them directly to uint8 loses RGB.
-        traj[image_key] = traj[image_key].cpu()
+    feature_transform = policy.vla.feature_transform
+    for image_key in feature_transform.org_features['images']:
+        if image_key in traj and hasattr(traj[image_key], "cpu"):
+            # Keep CHW/TCHW intact, including the explicit chronological head frames.
+            traj[image_key] = traj[image_key].cpu()
 
-    # if state or action is a 0-d tensor, convert it to 1-d tensor
-    for action_feature in policy.vla.feature_transform.org_features['actions']:
+    for action_feature in feature_transform.org_features['actions']:
         if len(traj[action_feature].shape) == 1:
             traj[action_feature] = traj[action_feature].unsqueeze(-1)
 
-    for state_feature in policy.vla.feature_transform.org_features['states']:
+    for state_feature in feature_transform.org_features['states']:
         if len(traj[state_feature].shape) == 0:
             traj[state_feature] = traj[state_feature].unsqueeze(-1)
 
+    # Use raw unnormalized GT directly instead of passing through apply()->unapply(),
+    # which would clip outliers via Normalizer and distort MSE/MAE.
     org_traj = dict(traj)
-    for k, v in org_traj.items():
-        if isinstance(v, np.ndarray):
-            org_traj[k] = torch.from_numpy(v)
-
-    feature_transform = policy.vla.feature_transform
-    original_disabled_image_features = feature_transform.disabled_image_features
-    feature_transform.disabled_image_features = True
-    try:
-        org_traj = feature_transform.apply(org_traj, training=False)
-        org_traj = feature_transform.unapply(org_traj)
-    finally:
-        feature_transform.disabled_image_features = original_disabled_image_features
+    if feature_transform.org_features["actions"]:
+        pad_key = f"{feature_transform.org_features['actions'][0]}_is_pad"
+        if pad_key in traj:
+            org_traj["action_is_pad"] = traj[pad_key]
 
     return traj, org_traj
 
@@ -168,7 +165,8 @@ def evaluate_single_trajectory(
 
     gt_action_across_time = []
     state_joints_across_time = []
-    pred_action_across_time  = []
+    pred_action_across_time = []
+    valid_mask_across_time = []
 
     action_features = policy.vla.feature_transform.org_features['actions']
     state_features = policy.vla.feature_transform.org_features['states']
@@ -179,20 +177,32 @@ def evaluate_single_trajectory(
             traj, org_traj = prepare_eval_observation(policy, dataset[data_id])
             count += 1
 
-            gt_action_across_time += [
-                np.concatenate(
-                    [to_numpy(org_traj[action_feature])[:action_horizon] for action_feature in action_features],
-                    axis=-1,
+            gt_chunk = np.concatenate(
+                [to_numpy(org_traj[action_feature])[:action_horizon] for action_feature in action_features],
+                axis=-1,
+            )
+            gt_action_across_time.append(gt_chunk)
+            if "action_is_pad" in org_traj:
+                valid_mask_across_time.append(~to_numpy(org_traj["action_is_pad"])[:action_horizon].astype(bool))
+            else:
+                valid_mask_across_time.append(np.ones(gt_chunk.shape[0], dtype=bool))
+            # Align state curve per step (reading only tabular state rows, no video decode).
+            chunk_states = []
+            for offset in range(gt_chunk.shape[0]):
+                row_idx = min(data_id + offset, end_id - 1)
+                row = dataset.hf_dataset[row_idx]
+                chunk_states.append(
+                    np.concatenate(
+                        [to_numpy(row[sf]).reshape(1, -1) for sf in state_features],
+                        axis=-1,
+                    )
                 )
-            ]
-            state_joints_across_time += [
-                np.concatenate([to_numpy(org_traj[state_feature]).reshape(1, -1) for state_feature in state_features], axis=-1)
-            ]
+            state_joints_across_time.append(np.concatenate(chunk_states, axis=0))
 
             preds = policy.infer(traj)
-            pred_action_across_time += [
+            pred_action_across_time.append(
                 np.concatenate([to_numpy(preds[action_feature]) for action_feature in action_features], axis=-1)
-            ]
+            )
 
             if count >= max_infer_time:
                 break
@@ -202,36 +212,45 @@ def evaluate_single_trajectory(
         for data_id in range(start_id, step_end_id):
             traj, org_traj = prepare_eval_observation(policy, dataset[data_id])
 
-            gt_action_across_time += [
+            gt_action_across_time.append(
                 np.concatenate(
                     [to_numpy(org_traj[action_feature])[:1] for action_feature in action_features],
                     axis=-1,
                 )
-            ]
-            state_joints_across_time += [
+            )
+            if "action_is_pad" in org_traj:
+                valid_mask_across_time.append(~to_numpy(org_traj["action_is_pad"])[:1].astype(bool))
+            else:
+                valid_mask_across_time.append(np.ones(1, dtype=bool))
+            state_joints_across_time.append(
                 np.concatenate([to_numpy(org_traj[state_feature]).reshape(1, -1) for state_feature in state_features], axis=-1)
-            ]
+            )
 
             preds = policy.infer(traj)
-            pred_action_across_time += [
+            pred_action_across_time.append(
                 np.concatenate(
                     [to_numpy(preds[action_feature]).reshape(1, -1) for action_feature in action_features],
                     axis=-1,
                 )
-            ]
-    
+            )
+
     gt_action_across_time = np.concatenate(gt_action_across_time, axis=0)
     state_joints_across_time = np.concatenate(state_joints_across_time, axis=0)
     pred_action_across_time = np.concatenate(pred_action_across_time, axis=0)
-    
+    valid_mask = np.concatenate(valid_mask_across_time, axis=0)
+
     pred_action_across_time = np.array(pred_action_across_time)
     assert gt_action_across_time.shape == pred_action_across_time.shape, (
         f"gt_action: {gt_action_across_time.shape}, pred_action: {pred_action_across_time.shape}"
     )
 
-    # calc MSE and MAE across time
-    mse = np.mean((gt_action_across_time - pred_action_across_time) ** 2)
-    mae = np.mean(np.abs(gt_action_across_time - pred_action_across_time))
+    # Calculate MSE and MAE only on non-padded trajectory steps.
+    if valid_mask.any():
+        diff = gt_action_across_time[valid_mask] - pred_action_across_time[valid_mask]
+    else:
+        diff = gt_action_across_time - pred_action_across_time
+    mse = float(np.mean(diff ** 2))
+    mae = float(np.mean(np.abs(diff)))
     logging.info(f"Unnormalized Action MSE across single traj: {mse}")
     logging.info(f"Unnormalized Action MAE across single traj: {mae}")
 
@@ -260,10 +279,11 @@ def main(policy, robo_name, data_root, traj_ids, chunk_size, save_plot_path, max
     policy.data_config.train_path = data_root
     policy.data_config.data_name = robo_name
 
-    data_path = Path(data_root)
-    if data_path.is_absolute() and data_path.exists():
-        repo_id = data_path.name
-        root = data_path
+    data_path = Path(data_root).expanduser()
+    if data_path.exists():
+        resolved = data_path.resolve()
+        repo_id = resolved.name
+        root = resolved
     else:
         repo_id = data_root
         root = None
@@ -272,8 +292,9 @@ def main(policy, robo_name, data_root, traj_ids, chunk_size, save_plot_path, max
     for action_feature in policy.vla.feature_transform.org_features['actions']:
         delta_timestamps[action_feature] = [t / dataset_meta.fps for t in range(policy.config.chunk_size)]
     if not policy.config.standalone_action_policy:
-        head_key = policy.vla.feature_transform.org_model_images[0]
-        delta_timestamps[head_key] = [-policy.config.head_history_offset / dataset_meta.fps, 0.0]
+        transform = policy.vla.feature_transform
+        timestamps = [offset / dataset_meta.fps for offset in transform.head_offsets]
+        delta_timestamps.update(dict.fromkeys(transform.org_head_model_images, timestamps))
     dataset = LeRobotDataset(
         repo_id,
         root=root,
@@ -367,4 +388,4 @@ if __name__ == "__main__":
     data_path = args.data_path if args.data_path is not None else model.data_config.train_path
     
     model.reset(args.robo_name)
-    main(model, args.robo_name, data_path, traj_ids, args.use_length, args.save_plot_path, args.max_infer_time, args.video_backend)
+    main(model, args.robo_name, data_path, traj_ids, model.use_length, args.save_plot_path, args.max_infer_time, args.video_backend)

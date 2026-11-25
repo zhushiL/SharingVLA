@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 let choosingFolder = false, applyingTask = false, connected = false;
-let status = null, inspected = null, folder = null, preview = null, previewKey = '', addressKey = '', initialized = false, noticeTimer;
+let status = null, inspected = null, folder = null, preview = null, previewKey = '', addressKey = '', initialized = false, noticeTimer, serverClockOffset = 0, xyzSchemaKey = '';
 const phases = {empty:'未加载',checking:'检查中',loading:'加载中',ready:'已就绪',unloading:'卸载中',error:'加载失败'};
 const initialCameras = $('camera-grid').innerHTML;
 const initialState = $('state-values').innerHTML;
@@ -86,6 +86,7 @@ function showAddresses(addresses){
 }
 async function refreshStatus(){
   const s=await api('status');status=s;connected=true;
+  if(Number.isFinite(s.server_time))serverClockOffset=s.server_time-Date.now()/1000;
   const locked=!['empty','error'].includes(s.phase),loading=['checking','loading','unloading'].includes(s.phase);
   text('phase',s.busy?'推理中':phases[s.phase]);$('phase').classList.toggle('loading',loading||s.busy);
   for(const id of ['load','inspect','browse','browse-path','checkpoint-path','dtype','compile'])$(id).disabled=locked||(id==='browse'&&choosingFolder);
@@ -95,7 +96,7 @@ async function refreshStatus(){
   const actionOnly=s.metadata.policy_name==='action_policy';$('task').disabled=actionOnly;$('apply-task').disabled=actionOnly;
   text('policy-badge',s.metadata.policy_name==='action_policy'?'ACTION POLICY':s.metadata.policy_name==='vla'?'VLA':'LOCAL');
   text('task-hint',actionOnly?'Action Policy 不使用任务文本':'下一次推理生效 · 保留 RTC 前缀');
-  $('apply-task').title='Ctrl / ⌘ + Enter';text('task-version',actionOnly?'VISION + STATE':'VLA');
+  $('apply-task').title='Ctrl / ⌘ + Enter';text('task-version',actionOnly?'双腕视觉':'VLA');
   text('submitted',actionOnly?'—':s.task_version?'v'+s.task_version:'—');
   text('active-task',s.active_task_version!==null?'v'+s.active_task_version:s.busy?'AP':'—');
   text('result-task',s.result_task_version!==null?'v'+s.result_task_version:actionOnly&&s.infer_ms!==null?'AP':'—');
@@ -116,21 +117,32 @@ async function refreshStatus(){
   renderTaskFeedback();
 }
 function clearPreview(){
-  if(!preview)return;preview=null;previewKey='';$('camera-grid').innerHTML=initialCameras;delete $('camera-grid').dataset.keys;delete $('camera-grid').dataset.count;
+  if(!preview)return;preview=null;previewKey='';xyzSchemaKey='';$('camera-grid').innerHTML=initialCameras;delete $('camera-grid').dataset.keys;delete $('camera-grid').dataset.count;
+  const selector=$('head-frame');selector.replaceChildren(new Option('头部 · 当前帧','current'));selector.value='current';selector.disabled=true;delete selector.dataset.lags;
   stateHistory=[];$('state-values').innerHTML=initialState;text('sequence','—');text('observation-info','等待观测');
 }
 function cameraLabel(key){
-  const short=key.replace('observation.images.','').replace(' / history','');
+  const [camera,lag]=key.split(' / history ');
+  const short=camera.replace('observation.images.','');
   const label=/head|top/.test(short)?'头部':/left/.test(short)?'左腕':/right/.test(short)?'右腕':short;
-  return label+(key.endsWith('/ history')?' · 历史':'');
+  return lag ? label+' · 历史 '+lag : label;
 }
 function renderCameras(p){
   const cameraOrder={'左腕':0,'头部':1,'右腕':2};
-  const keys=Object.keys(p.images).filter(key=>!key.endsWith(' / history'))
+  const names=Object.keys(p.images);
+  const keys=names.filter(key=>!key.includes(' / history '))
     .sort((a,b)=>(cameraOrder[cameraLabel(a)]??3)-(cameraOrder[cameraLabel(b)]??3));
-  const selected=keys.map(key=>$('head-frame').value==='history'&&p.images[key+' / history']?key+' / history':key);
+  const lags=[...new Set(names.filter(key=>key.includes(' / history ')).map(key=>Number(key.split(' / history ')[1])))].sort((a,b)=>a-b);
+  const selector=$('head-frame');
+  if(selector.dataset.lags!==lags.join(',')){
+    const previous=selector.value;
+    selector.replaceChildren(new Option('头部 · 当前帧','current'),...lags.map(lag=>new Option('头部 · 历史 '+lag,String(lag))));
+    if(lags.includes(Number(previous)))selector.value=previous;
+    selector.dataset.lags=lags.join(',');
+  }
+  selector.disabled=lags.length===0;
+  const selected=keys.map(key=>p.images[key+' / history '+selector.value]?key+' / history '+selector.value:key);
   const grid=$('camera-grid');
-  $('head-frame').disabled=!Object.keys(p.images).some(key=>key.endsWith(' / history'));
   if(!selected.length){grid.replaceChildren(el('div','无可用图像','xyz-empty'));delete grid.dataset.keys;delete grid.dataset.count;return;}
   if(grid.dataset.keys!==JSON.stringify(selected)){
     grid.replaceChildren(...selected.map(key=>{const card=el('div',undefined,'camera'),img=el('img');img.alt=key;card.append(img,el('span',cameraLabel(key),'camera-label'));card.title=key;return card;}));
@@ -159,14 +171,25 @@ function drawSparkline(canvas, group){
 }
 function renderXYZ(p){
   const groups=status?.schema.state_xyz||[];
-  $('state-values').replaceChildren(...groups.map(group=>{
-    const block=el('div',undefined,'state-block'),row=el('div',undefined,'xyz-row');block.title=group.key;
-    block.append(el('h3',group.label));
-    group.indices.forEach((index,axis)=>{const cell=el('div',undefined,'xyz-value'),value=p.states[group.key]?.[index];cell.append(el('span',['X','Y','Z'][axis]),el('strong',Number.isFinite(value)?value.toFixed(3):'—'));row.append(cell);});
-    const canvas=el('canvas',undefined,'state-sparkline');canvas.setAttribute('aria-label',group.label+' XYZ 近期变化');block.append(row,canvas);return block;
-  }));
-  if(!groups.length)$('state-values').append(el('div','未配置 TCP XYZ','xyz-empty'));
-  $('state-values').querySelectorAll('canvas').forEach((canvas,i)=>drawSparkline(canvas,groups[i]));
+  const container=$('state-values');
+  const nextKey=JSON.stringify(groups);
+  if(nextKey!==xyzSchemaKey){
+    xyzSchemaKey=nextKey;
+    if(!groups.length){container.replaceChildren(el('div','未配置 TCP XYZ','xyz-empty'));return;}
+    container.replaceChildren(...groups.map(group=>{
+      const block=el('div',undefined,'state-block'),row=el('div',undefined,'xyz-row');block.title=group.key;
+      block.append(el('h3',group.label));
+      group.indices.forEach((index,axis)=>{const cell=el('div',undefined,'xyz-value');cell.append(el('span',['X','Y','Z'][axis]),el('strong','—'));row.append(cell);});
+      const canvas=el('canvas',undefined,'state-sparkline');canvas.setAttribute('aria-label',group.label+' XYZ 近期变化');block.append(row,canvas);return block;
+    }));
+  }
+  if(!groups.length)return;
+  [...container.children].forEach((block,groupIdx)=>{
+    const group=groups[groupIdx];if(!group)return;
+    const values=block.querySelectorAll('.xyz-value strong');
+    group.indices.forEach((index,axis)=>{const value=p.states[group.key]?.[index];if(values[axis])values[axis].textContent=Number.isFinite(value)?value.toFixed(3):'—';});
+    const canvas=block.querySelector('canvas');if(canvas)drawSparkline(canvas,group);
+  });
 }
 window.addEventListener('resize',()=>{if(preview)renderXYZ(preview);});
 function renderPreview(p){
@@ -180,8 +203,20 @@ function renderPreview(p){
   renderCameras(p);renderXYZ(p);
 }
 async function poll(){
-  try{await refreshStatus();renderPreview(await api('observation'));}catch(error){connected=false;text('phase','服务断开');text('client-status','服务断开');renderTaskFeedback();}
-  if(preview){const age=Date.now()/1000-preview.received_at;text('freshness',(age>2?'已过期 · ':'')+age.toFixed(1)+' s');}else text('freshness','等待观测');
-  setTimeout(poll,250);
+  try{
+    await refreshStatus();
+    const remoteKey=status?.preview_key||'';
+    if(!remoteKey){clearPreview();}
+    else if(remoteKey!==previewKey){
+      const response=await fetch('/api/observation?since='+encodeURIComponent(previewKey),{cache:'no-store'});
+      if(response.status!==204){
+        const data=await response.json();
+        if(!response.ok)throw new Error(data.error||response.statusText);
+        renderPreview(data);
+      }
+    }
+  }catch(error){connected=false;text('phase','服务断开');text('client-status','服务断开');renderTaskFeedback();}
+  if(preview){const nowServer=Date.now()/1000+serverClockOffset;const age=Math.max(0,nowServer-preview.received_at);text('freshness',(age>2?'已过期 · ':'')+age.toFixed(1)+' s');}else text('freshness','等待观测');
+  setTimeout(poll,document.hidden?1000:250);
 }
 poll();

@@ -25,7 +25,7 @@ from transformers.utils import logging as transformers_logging
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
-from .loader import get_loader
+from .module_utils import build_empty_policy, load_model_weights
 
 
 if TYPE_CHECKING:
@@ -61,9 +61,7 @@ def build_foundation_model(
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
     init_device: Literal["cpu", "cuda", "meta"] = "cuda",
 ) -> "PreTrainedModel":
-    """
-    Build VLA through its registered strict checkpoint loader.
-    """
+    """Construct an independent or composed policy and load its selected weights."""
 
     if getattr(config, "model_type", None) != "vla":
         raise TypeError(
@@ -71,46 +69,22 @@ def build_foundation_model(
             f"got model_type={getattr(config, 'model_type', None)!r}."
         )
 
+    # The same fully qualified keys are used by standalone and composed policies.
     full_checkpoint = weights_path is not None
-    source_weights_path = weights_path if full_checkpoint else config.vlm_path
-    if not source_weights_path:
-        raise ValueError("Provide a complete weights_path or a Qwen vlm_path.")
-    logger.info_rank0(f"Initializing from {source_weights_path!r} (complete checkpoint: {full_checkpoint}).")
+    if config.standalone_action_policy and not full_checkpoint:
+        if bool(config.spatial_encoder_path) == bool(config.action_policy_path):
+            raise ValueError("Provide either spatial_encoder_path for pretraining or a full action_policy_path.")
+        weights_path = config.action_policy_path or config.spatial_encoder_path
+        full_checkpoint = config.action_policy_path is not None
+    elif not full_checkpoint:
+        if not config.vlm_path or not config.action_policy_path:
+            raise ValueError("Assembling a VLA requires vlm_path and action_policy_path.")
+        weights_path = config.vlm_path
 
-    loader = get_loader(config)
-    init_kwargs = {
-        "config": config,
-        "torch_dtype": getattr(torch, torch_dtype),
-    }
-
-    if (init_device == "cpu" and get_parallel_state().global_rank > 0) or init_device == "meta":
-        empty_init = True
-    else:
-        empty_init = False
-    model = loader.load_model(
-        init_kwargs=init_kwargs,
-        weights_path=source_weights_path,
-        empty_init=empty_init,
-        init_device=init_device,
-        load_vlm_only=not full_checkpoint,
-        load_full_checkpoint=full_checkpoint,
-    )
+    logger.info_rank0(f"Initializing policy from {weights_path!r}.")
+    model = build_empty_policy(config, getattr(torch, torch_dtype))
+    if init_device == "meta":
+        model._deferred_weight_load = {"weights_path": weights_path, "load_full_checkpoint": full_checkpoint}
+    elif init_device != "cpu" or get_parallel_state().global_rank <= 0:
+        load_model_weights(model, weights_path, init_device, load_full_checkpoint=full_checkpoint)
     return model
-
-
-class VisionProcessor:
-    """Image-only processor bundle; never constructs or loads a tokenizer."""
-
-    def __init__(self, image_processor):
-        self.image_processor = image_processor
-
-    def save_pretrained(self, path):
-        return self.image_processor.save_pretrained(path)
-
-
-def build_image_processor(processor_path: str, *, local_files_only: bool = False) -> VisionProcessor:
-    from transformers import AutoImageProcessor
-
-    return VisionProcessor(AutoImageProcessor.from_pretrained(
-        processor_path, trust_remote_code=False, local_files_only=local_files_only,
-    ))

@@ -35,16 +35,45 @@ def network_addresses(host, web_port, policy_port):
     return addresses
 
 
+async def _json_object(request) -> dict:
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+    return body
+
+
+async def _terminate_process(process, timeout: float = 3.0) -> None:
+    if process is None or process.returncode is not None:
+        return
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        process.kill()
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+
+
 class ConsoleService:
-    def __init__(self, roots, host="0.0.0.0", web_port=8080, policy_port=8006, runtime=None, restrict_checkpoints=False):
+    def __init__(
+        self,
+        roots,
+        host="127.0.0.1",
+        web_port=8080,
+        policy_port=8006,
+        runtime=None,
+        restrict_checkpoints=True,
+        api_key=None,
+    ):
         self.roots = [Path(root).expanduser().resolve() for root in roots]
         self.restrict_checkpoints = restrict_checkpoints
         self.host, self.web_port, self.policy_port = host, web_port, policy_port
+        self.api_key = api_key if api_key else None
         self.runtime = runtime or ConsoleRuntime()
         self.server = None
         self.load_task = None
         self.picker_process = None
         self.picker_busy = False
+        self._state_lock = asyncio.Lock()
 
     def resolve(self, value):
         path = Path(value).expanduser().resolve()
@@ -70,7 +99,7 @@ class ConsoleService:
             raise ValueError("系统选择器不可用，请使用路径选择")
         if self.runtime.phase not in {"empty", "error"}:
             raise ValueError("请先卸载当前模型")
-        body = await request.json()
+        body = await _json_object(request)
         if self.picker_busy:
             raise ValueError("文件夹选择窗口已打开")
         try:
@@ -96,19 +125,23 @@ class ConsoleService:
             selected = stdout.decode("utf-8").removesuffix("\n")
             return web.json_response({"path": str(self.resolve(selected)) if selected else None})
         finally:
-            if process and process.returncode is None:
-                process.terminate()
-                await process.wait()
+            await _terminate_process(process)
             self.picker_process = None
             self.picker_busy = False
 
     async def status(self, request):
+        self.runtime.mark_preview_polled()
         return web.json_response({**self.runtime.status(), "roots": list(dict.fromkeys(str(r) for r in (self.roots if self.restrict_checkpoints else [*self.roots, Path.home(), Path("/")]))),
                                   "addresses": network_addresses(self.host, self.web_port, self.policy_port),
                                   "native_picker_available": bool(self.native_picker_command(request)),
                                   "policy_listening": self.server is not None})
 
     async def observation(self, request):
+        self.runtime.mark_preview_polled()
+        since = request.query.get("since")
+        current_key = self.runtime.preview_key()
+        if since is not None and since == current_key:
+            return web.Response(status=204)
         return web.json_response(self.runtime.preview)
 
     async def browse(self, request):
@@ -134,18 +167,19 @@ class ConsoleService:
         return web.json_response(await asyncio.to_thread(listing))
 
     async def inspect(self, request):
-        body = await request.json()
+        body = await _json_object(request)
         path = self.resolve(body["path"])
         return web.json_response(await asyncio.to_thread(inspect_checkpoint, path))
 
     async def load(self, request):
+        body = await _json_object(request)
         rt = self.runtime
-        if rt.phase not in {"empty", "error"} or (self.load_task and not self.load_task.done()):
-            raise ValueError("请先断开 client 并卸载当前模型")
-        body = await request.json()
-        path = self.resolve(body["path"])
-        # Reserve before awaiting filesystem inspection so double clicks cannot load twice.
-        rt.phase, rt.error = "checking", None
+        async with self._state_lock:
+            if rt.phase not in {"empty", "error"} or (self.load_task and not self.load_task.done()):
+                raise ValueError("请先断开 client 并卸载当前模型")
+            path = self.resolve(body["path"])
+            # Atomically reserve before awaiting filesystem inspection so concurrent POSTs cannot race.
+            rt.phase, rt.error = "checking", None
         try:
             info = await asyncio.to_thread(inspect_checkpoint, path)
             robot = body.get("robot_name") or info["robot_name"]
@@ -162,8 +196,14 @@ class ConsoleService:
     async def load_background(self, info, robot, dtype, compile_model):
         try:
             await self.runtime.load(info, robot, dtype, compile_model)
-            wrapper = WebsocketPolicyServer(self.runtime, self.host, self.policy_port,
-                                            self.runtime.metadata, self.runtime.connection_changed)
+            wrapper = WebsocketPolicyServer(
+                self.runtime,
+                self.host,
+                self.policy_port,
+                self.runtime.metadata,
+                self.runtime.connection_changed,
+                api_key=self.api_key,
+            )
             self.server = await wrapper.start()
         except Exception as error:
             log.exception("Console model startup failed")
@@ -174,9 +214,10 @@ class ConsoleService:
 
     async def unload(self, request):
         rt = self.runtime
-        if rt.client or rt.busy or rt.phase not in {"ready", "error"} or (self.load_task and not self.load_task.done()):
-            raise ValueError("请先断开机器人 client，并等待加载或推理结束")
-        rt.phase = "unloading"
+        async with self._state_lock:
+            if rt.client or rt.busy or rt.phase not in {"ready", "error"} or (self.load_task and not self.load_task.done()):
+                raise ValueError("请先断开机器人 client，并等待加载或推理结束")
+            rt.phase = "unloading"
         if self.server:
             self.server.close()
             await self.server.wait_closed()
@@ -188,14 +229,12 @@ class ConsoleService:
         return web.json_response({"status": "empty"})
 
     async def task(self, request):
-        body = await request.json()
+        body = await _json_object(request)
         version = self.runtime.set_task(body.get("task"))
         return web.json_response({"task_version": version})
 
     async def cleanup(self, app):
-        if self.picker_process and self.picker_process.returncode is None:
-            self.picker_process.terminate()
-            await self.picker_process.wait()
+        await _terminate_process(self.picker_process)
         if self.load_task:
             await self.load_task
         if self.server:
@@ -240,11 +279,21 @@ def create_app(service):
 
 def main():
     parser = argparse.ArgumentParser(description="启动离线推理控制台；在页面选择完整 hf_ckpt")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="127.0.0.1", help="监听地址，默认 127.0.0.1；需要局域网访问时显式传 0.0.0.0")
     parser.add_argument("--web-port", type=int, default=8080)
     parser.add_argument("--port", type=int, default=8006, help="机器人 WebSocket 端口，加载成功后开放")
-    parser.add_argument("--checkpoint-root", action="append", help="目录选择器的快捷目录，可重复；默认当前目录")
-    parser.add_argument("--restrict-checkpoints", action="store_true", help="仅允许浏览和加载 checkpoint-root 内的权重；默认可选择任意本机目录")
+    parser.add_argument("--checkpoint-root", action="append", help="允许浏览和加载的根目录，可重复；默认当前目录")
+    parser.add_argument(
+        "--restrict-checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="仅允许浏览和加载 checkpoint-root 内的权重（默认开启；传 --no-restrict-checkpoints 可显式放开）",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("POLICY_API_KEY"),
+        help="可选 WebSocket 推理端口鉴权密钥（Authorization: Api-Key <key>）",
+    )
     parser.add_argument("--preview-fps", type=float, default=5, help="页面预览编码上限，1–15 Hz")
     args = parser.parse_args()
     if not 1 <= args.preview_fps <= 15 or args.port == args.web_port:
@@ -255,8 +304,15 @@ def main():
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    service = ConsoleService(args.checkpoint_root or [Path.cwd()], args.host, args.web_port, args.port,
-                             ConsoleRuntime(preview_fps=args.preview_fps), restrict_checkpoints=args.restrict_checkpoints)
+    service = ConsoleService(
+        args.checkpoint_root or [Path.cwd()],
+        args.host,
+        args.web_port,
+        args.port,
+        ConsoleRuntime(preview_fps=args.preview_fps),
+        restrict_checkpoints=args.restrict_checkpoints,
+        api_key=args.api_key,
+    )
     for address in network_addresses(args.host, args.web_port, args.port):
         if address["reachable_bind"]:
             log.info("Console %s | Client %s (%s)", address["page_url"], address["policy_url"], address["interface"])

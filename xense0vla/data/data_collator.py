@@ -72,14 +72,20 @@ class MakeMicroBatchCollator(DataCollator):
     internal_data_collator: "DataCollator"
 
     def __call__(self, features: Sequence[Tuple[Dict[str, "torch.Tensor"]]]) -> List[Dict[str, "torch.Tensor"]]:
-        micro_batch_size = len(features) // self.num_micro_batch
-        if isinstance(features[0], list):
-            for i in range(len(features)):
-                features[i] = features[i][0]  # 1-to-N inverse transform
+        if not features:
+            raise ValueError("MakeMicroBatchCollator received an empty batch.")
+        features_list = list(features)
+        if isinstance(features_list[0], list):
+            features_list = [item[0] for item in features_list]  # 1-to-N inverse transform
 
+        num_chunks = min(max(1, int(self.num_micro_batch)), len(features_list))
+        base, remainder = divmod(len(features_list), num_chunks)
         micro_batches = []
-        for i in range(0, len(features), micro_batch_size):
-            micro_batches.append(self.internal_data_collator(features[i : i + micro_batch_size]))
+        offset = 0
+        for chunk_idx in range(num_chunks):
+            size = base + (1 if chunk_idx < remainder else 0)
+            micro_batches.append(self.internal_data_collator(features_list[offset : offset + size]))
+            offset += size
 
         return micro_batches
 

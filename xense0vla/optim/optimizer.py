@@ -27,7 +27,33 @@ from .muon import DistributedMuon, split_muon_adamw_params
 
 
 _VLM_PARAMETER_PATH = "model.backbone."
-_ACTION_PARAMETER_PATH = "model.action_policy."
+_SPATIAL_PARAMETER_PATH = "model.action_policy.spatial_encoder."
+_NO_DECAY_NAME_PATTERNS: Tuple[str, ...] = (
+    "bias",
+    "norm",
+    "modulation",
+    "a_log",
+    "dt_bias",
+    "embed_tokens",
+    "embedding",
+)
+
+
+def _collect_no_decay_fqns(model: "torch.nn.Module") -> set:
+    fqns: set = set()
+    norm_types = (torch.nn.LayerNorm, torch.nn.RMSNorm, torch.nn.GroupNorm, torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d, torch.nn.Embedding)
+    for module_name, module in model.named_modules():
+        if isinstance(module, norm_types) or "norm" in module.__class__.__name__.lower():
+            for pname, _ in module.named_parameters(recurse=False):
+                fqns.add(f"{module_name}.{pname}" if module_name else pname)
+    return fqns
+
+
+def _is_no_decay_param(name: str, param: torch.Tensor, no_decay_fqns: set) -> bool:
+    if param.ndim < 2 or name in no_decay_fqns or name.endswith(".bias"):
+        return True
+    lname = name.lower()
+    return any(pat in lname for pat in _NO_DECAY_NAME_PATTERNS)
 
 
 def _split_named_params_by_module_lr(
@@ -35,31 +61,52 @@ def _split_named_params_by_module_lr(
     names: Sequence[str],
     base_lr: float,
     vlm_lr: Optional[float],
-    action_policy_lr: Optional[float],
+    spatial_encoder_lr: Optional[float],
+    *,
+    weight_decay: float = 0.0,
+    no_decay_fqns: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
     if len(params) != len(names):
         raise ValueError("Parameter and FQN lists must have the same length.")
 
-    base_params: List[torch.Tensor] = []
-    vlm_params: List[torch.Tensor] = []
-    action_params: List[torch.Tensor] = []
+    no_decay_set = no_decay_fqns or set()
+    buckets: Dict[Tuple[str, bool], List[torch.Tensor]] = {
+        ("base", True): [],
+        ("base", False): [],
+        ("vlm", True): [],
+        ("vlm", False): [],
+        ("spatial_encoder", True): [],
+        ("spatial_encoder", False): [],
+    }
+    lr_by_bucket = {
+        "base": base_lr,
+        "vlm": vlm_lr if vlm_lr is not None else base_lr,
+        "spatial_encoder": spatial_encoder_lr if spatial_encoder_lr is not None else base_lr,
+    }
     for param, name in zip(params, names):
         if vlm_lr is not None and _VLM_PARAMETER_PATH in name:
-            vlm_params.append(param)
-        elif action_policy_lr is not None and _ACTION_PARAMETER_PATH in name:
-            action_params.append(param)
+            bucket = "vlm"
+        elif spatial_encoder_lr is not None and _SPATIAL_PARAMETER_PATH in name:
+            bucket = "spatial_encoder"
         else:
-            base_params.append(param)
+            bucket = "base"
+        use_decay = weight_decay > 0.0 and not _is_no_decay_param(name, param, no_decay_set)
+        buckets[(bucket, use_decay)].append(param)
 
     groups: List[Dict[str, Any]] = []
-    if base_params:
-        groups.append({"params": base_params, "lr": base_lr, "group_name": "base"})
-    if vlm_params:
-        groups.append({"params": vlm_params, "lr": vlm_lr, "group_name": "vlm"})
-    if action_params:
-        groups.append(
-            {"params": action_params, "lr": action_policy_lr, "group_name": "action_policy"}
-        )
+    for bucket in ("base", "vlm", "spatial_encoder"):
+        for use_decay in (True, False):
+            group_params = buckets[(bucket, use_decay)]
+            if group_params:
+                suffix = "" if use_decay or weight_decay == 0.0 else "_no_decay"
+                groups.append(
+                    {
+                        "params": group_params,
+                        "lr": lr_by_bucket[bucket],
+                        "weight_decay": weight_decay if use_decay else 0.0,
+                        "group_name": f"{bucket}{suffix}",
+                    }
+                )
     return groups
 
 
@@ -67,8 +114,10 @@ def _build_module_lr_param_groups(
     model: "torch.nn.Module",
     base_lr: float,
     vlm_lr: Optional[float],
-    action_policy_lr: Optional[float],
+    spatial_encoder_lr: Optional[float],
+    weight_decay: float = 0.0,
 ) -> List[Dict[str, Any]]:
+    no_decay_fqns = _collect_no_decay_fqns(model)
     trainable = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
     names = [name for name, _ in trainable]
     params = [param for _, param in trainable]
@@ -77,37 +126,9 @@ def _build_module_lr_param_groups(
         names,
         base_lr,
         vlm_lr,
-        action_policy_lr,
-    )
-
-
-def _split_named_params_by_vlm_lr(
-    params: Sequence[torch.Tensor],
-    names: Sequence[str],
-    base_lr: float,
-    vlm_lr: Optional[float],
-) -> List[Dict[str, Any]]:
-    """Compatibility wrapper for callers that only configure a VLM-specific LR."""
-    return _split_named_params_by_module_lr(
-        params,
-        names,
-        base_lr,
-        vlm_lr,
-        action_policy_lr=None,
-    )
-
-
-def _build_vlm_lr_param_groups(
-    model: "torch.nn.Module",
-    base_lr: float,
-    vlm_lr: Optional[float],
-) -> List[Dict[str, Any]]:
-    """Compatibility wrapper for callers that only configure a VLM-specific LR."""
-    return _build_module_lr_param_groups(
-        model,
-        base_lr,
-        vlm_lr,
-        action_policy_lr=None,
+        spatial_encoder_lr,
+        weight_decay=weight_decay,
+        no_decay_fqns=no_decay_fqns,
     )
 
 
@@ -226,14 +247,16 @@ def build_optimizer(
     optimizer_type: str = "adamw",
     param_groups: Optional[Sequence[Dict[str, Any]]] = None,
     vlm_lr: Optional[float] = None,
-    action_policy_lr: Optional[float] = None,
+    spatial_encoder_lr: Optional[float] = None,
 ) -> "torch.optim.Optimizer":
     if param_groups is None:
-        param_groups = _build_module_lr_param_groups(model, lr, vlm_lr, action_policy_lr)
-    elif vlm_lr is not None or action_policy_lr is not None:
+        param_groups = _build_module_lr_param_groups(
+            model, lr, vlm_lr, spatial_encoder_lr, weight_decay=weight_decay
+        )
+    elif vlm_lr is not None or spatial_encoder_lr is not None:
         special_lr_names = [
             name
-            for name, value in (("vlm_lr", vlm_lr), ("action_policy_lr", action_policy_lr))
+            for name, value in (("vlm_lr", vlm_lr), ("spatial_encoder_lr", spatial_encoder_lr))
             if value is not None
         ]
         special_lr_label = " and ".join(special_lr_names)
@@ -323,21 +346,26 @@ def build_muon_optimizer(
         extra_adamw_name_patterns=getattr(args_train, "muon_exclude_name_patterns", None) or None,
     )
 
+    no_decay_fqns = _collect_no_decay_fqns(model)
     vlm_lr = getattr(args_train, "vlm_lr", None)
-    action_policy_lr = getattr(args_train, "action_policy_lr", None)
+    spatial_encoder_lr = getattr(args_train, "spatial_encoder_lr", None)
     muon_groups = _split_named_params_by_module_lr(
         muon_params,
         muon_names,
         lr,
         vlm_lr,
-        action_policy_lr,
+        spatial_encoder_lr,
+        weight_decay=weight_decay,
+        no_decay_fqns=no_decay_fqns,
     )
     adamw_groups = _split_named_params_by_module_lr(
         adamw_params,
         adamw_names,
         lr,
         vlm_lr,
-        action_policy_lr,
+        spatial_encoder_lr,
+        weight_decay=weight_decay,
+        no_decay_fqns=no_decay_fqns,
     )
 
     if not muon_groups:
@@ -358,14 +386,15 @@ def build_muon_optimizer(
 
     inner_opts: List[Optimizer] = [muon_opt]
     if adamw_groups:
-        foreach = not is_torch_npu_available()
+        fused = False if is_torch_npu_available() else bool(getattr(args_train, "fused_optimizer", False))
+        foreach = False if is_torch_npu_available() else (not fused)
         adamw_opt = AdamW(
             adamw_groups,
             lr=lr,
             betas=adamw_betas,
             eps=adamw_eps,
             weight_decay=weight_decay,
-            fused=False,
+            fused=fused,
             foreach=foreach,
         )
         inner_opts.append(adamw_opt)

@@ -1,3 +1,4 @@
+import bisect
 from typing import Callable
 
 import numpy as np
@@ -33,7 +34,6 @@ class MultiVLADataset(Dataset):
         tolerances_s: dict | None = None,
         video_backend: str = "torchcodec",
         chunk_size: int = 20,
-        image_size=(224, 224),
         do_nomalize=True,
         disabled_image_features=False,
         return_item=False,
@@ -72,7 +72,6 @@ class MultiVLADataset(Dataset):
                 processor,
                 video_backend=video_backend,
                 chunk_size=chunk_size,
-                image_size=image_size,
                 do_nomalize=do_nomalize,
                 return_item=return_item,
                 disabled_image_features=disabled_image_features,
@@ -124,8 +123,7 @@ class MultiVLADataset(Dataset):
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of bounds.")
         # Determine which dataset to get an item from based on the index.
-        dataset_idx = np.searchsorted(self.dataset_start_index, np.array([idx]), side="right") - 1
-        dataset_idx = dataset_idx[0]
+        dataset_idx = bisect.bisect_right(self.dataset_start_index, idx) - 1
         dataset = self._datasets[dataset_idx]
         local_idx = idx - self.dataset_start_index[dataset_idx]
         frame_indices = self.frame_indices[dataset_idx]
@@ -149,24 +147,31 @@ class MultiVLADataset(Dataset):
 
         if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of bounds.")
-        max_retries = 200
+        max_retries = 20
         attempts = 0
         cur = idx
         last_err = None
-        # return self.getdata(cur)
         while attempts < max_retries:
             try:
                 return self.getdata(cur)
+            except (KeyError, TypeError, AssertionError, AttributeError, NotImplementedError):
+                # Deterministic schema/config/code bugs must fail fast instead of
+                # silently dropping sub-datasets and skewing sampling weights.
+                raise
             except Exception as e:
                 last_err = e
                 attempts += 1
-                dataset_idx = np.searchsorted(self.dataset_start_index, np.array([cur]), side="right") - 1
-                dataset_idx = dataset_idx[0]
+                dataset_idx = bisect.bisect_right(self.dataset_start_index, cur) - 1
                 dataset = self._datasets[dataset_idx]
-                logger.info(f"Last error: {repr(last_err)},\nDataset: {dataset.dataset.repo_id}")
-                cur = np.random.randint(0, len(self))
-                if cur >= len(self):
-                    cur = 0
+                logger.warning(
+                    "Sample fetch retry %d/%d failed on dataset %s (idx=%d): %r",
+                    attempts,
+                    max_retries,
+                    dataset.dataset.repo_id,
+                    cur,
+                    last_err,
+                )
+                cur = int(np.random.randint(0, len(self)))
                 continue
 
         raise RuntimeError(

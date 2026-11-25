@@ -18,12 +18,12 @@ from .ee_pose_transform import (
 from .transforms import (
     Normalizer,
     concatenate_visuals,
+    history_offsets,
     prepare_action,
     prepare_images,
     prepare_language,
     prepare_state,
     prepare_subtask,
-    resize_visual,
 )
 
 
@@ -68,7 +68,6 @@ class FeatureTransform:
         norm_stats_path=None,
         return_raw_images=False,
         image_augment=False,
-        image_size=(256, 256),
     ):
 
         assert os.path.exists(robot_config_path), f"{robot_config_path} does not exist."
@@ -99,9 +98,7 @@ class FeatureTransform:
 
         self.action_only = bool(config_value("standalone_action_policy", False))
         self.use_subtask_loss = bool(config_value("use_subtask_loss", False))
-        self.head_history_offset = int(config_value("head_history_offset", 30))
-        if self.head_history_offset < 0:
-            raise ValueError("head_history_offset must be non-negative.")
+        self.head_offsets = history_offsets(config_value("history_memory", 3), config_value("history_stride", 30))
         configured_images = self.feature_config.images or [
             "observation.images.camera_top",
             "observation.images.camera_wrist_left",
@@ -115,6 +112,8 @@ class FeatureTransform:
             raise ValueError("Expected [left wrist, right wrist] for action policy or [head, left wrist, right wrist] for VLA.")
         self.head_model_image = None if self.action_only else configured_images[0]
         self.model_images = list(configured_images[1:] if self.action_only else configured_images)
+        if not self.feature_config.images:
+            self.feature_config.images = list(self.model_images)
         active_images = set(self.model_images)
         robot_config["images"] = [
             entry
@@ -143,7 +142,6 @@ class FeatureTransform:
         # disabled_image_features: keep the image features or not when getting lerobot item
         self.disabled_image_features = disabled_image_features
         self.return_raw_images = return_raw_images
-        self.image_size = image_size
 
         if not disabled_image_features:
             self.image_augment = image_augment
@@ -174,12 +172,6 @@ class FeatureTransform:
         self.org_head_model_images = self.get_origin_image_features(
             [self.head_model_image] if self.head_model_image is not None else []
         )
-        self.output_image_keys = (
-            self.model_images
-            if self.action_only
-            else [self.head_model_image + ".history", self.head_model_image, *self.model_images[1:]]
-        )
-
         self.normalizer = self.get_normalizer(norm_stats_path, do_nomalize, data_config)
 
     def get_origin_image_features(self, target_images):
@@ -187,8 +179,7 @@ class FeatureTransform:
         origin_images = []
         for target_image in target_images:
             if target_image not in self.images:
-                # Unified multi-robot configs may reserve a model-camera slot
-                # that this robot does not provide; prepare_images zero-pads it.
+                # Statistics-only transforms also work with camera-free datasets.
                 continue
             convert_info = self.key_mapping.get(target_image)
             if convert_info is None:
@@ -211,7 +202,11 @@ class FeatureTransform:
         if not do_nomalize:
             return None
 
-        action_state_norm_type = {k: v for d in data_config.norm_type for k, v in ast.literal_eval(d).items()}
+        action_state_norm_type = {
+            k: v
+            for d in data_config.norm_type
+            for k, v in (ast.literal_eval(d) if isinstance(d, str) else dict(d)).items()
+        }
 
         if not norm_stats_path:
             raise ValueError("Normalization is enabled but no norm_stats_path was provided.")
@@ -229,12 +224,23 @@ class FeatureTransform:
         for feature in self.images:
             norm_type[feature] = "identity"
 
-        with open(norm_stats_path) as f:
+        with open(norm_stats_path, encoding="utf-8") as f:
             norm_stats = json.load(f)
-        f.close()
+
+        stats_map = norm_stats["norm_stats"]
+        required_stat_keys = [
+            key
+            for key in (*self.actions, *self.states)
+            if norm_type.get(key, "identity") not in {"identity", "sincos"}
+        ]
+        missing_stat_keys = [key for key in required_stat_keys if key not in stats_map]
+        if missing_stat_keys:
+            raise KeyError(
+                f"Normalization stats file {norm_stats_path!r} is missing required keys: {missing_stat_keys}."
+            )
 
         normalizer = Normalizer(
-            norm_stats=norm_stats["norm_stats"],
+            norm_stats=stats_map,
             norm_type=norm_type,
         )
 
@@ -309,8 +315,9 @@ class FeatureTransform:
                                 f"{target_feature} cannot be subtracted from state"
                             )
 
+                        default_relative_type = "local" if "end.position" in target_feature else None
                         action_relative_type[target_feature] = feature_convert_info[target_feature].pop(
-                            "relative_type", "local"
+                            "relative_type", default_relative_type
                         )
                         if action_relative_type[target_feature] not in {None, "world", "local"}:
                             raise ValueError("relative_type must be 'world', 'local' or null.")
@@ -397,7 +404,7 @@ class FeatureTransform:
         for feature_category, feature in org_features.items():
             if feature_category == "actions":
                 if len(feature) == 0 and len(self.actions_convert_from_state) > 0:
-                    org_features["actions"] == []
+                    org_features["actions"] = []
                     continue
             if len(feature) == 0:
                 org_features[feature_category] = target_features[feature_category]
@@ -406,6 +413,15 @@ class FeatureTransform:
 
         self.key_mapping = to_convert_features
         self.key_reverse_mapping = reverse_convert_features
+        self._mapped_feature_widths = {}
+        for target_key, convert_info in to_convert_features.items():
+            origin_keys = convert_info.get("origin_keys")
+            if isinstance(origin_keys, OrderedDict) and all(
+                isinstance(info, dict) and "start" in info and "end" in info for info in origin_keys.values()
+            ):
+                self._mapped_feature_widths[target_key] = sum(
+                    int(info["end"]) - int(info["start"]) for info in origin_keys.values()
+                )
 
     def convert_features(self, item, w_action):
         out_item = {}
@@ -434,28 +450,25 @@ class FeatureTransform:
 
             assert isinstance(convert_info["origin_keys"], OrderedDict)
             concat_list = []
-            convert_success = True
             for origin_key, origin_info in convert_info["origin_keys"].items():
                 origin_key = origin_key.split("*")[0]
                 if origin_key not in item:
-                    convert_success = False
-                    break
-                origin_data = item.get(origin_key)[..., origin_info["start"] : origin_info["end"]]
-                concat_list.append(origin_data)
-            if convert_success:
-                out_item[target_key] = torch.cat(concat_list, dim=-1)
+                    raise KeyError(f"Missing source feature {origin_key!r} required by {target_key!r}.")
+                source_tensor = item[origin_key]
+                start = int(origin_info["start"])
+                end = int(origin_info["end"])
+                if start < 0 or end <= start or source_tensor.shape[-1] < end:
+                    raise ValueError(
+                        f"Feature slice [{start}:{end}] for {target_key!r} exceeds source "
+                        f"{origin_key!r} width {source_tensor.shape[-1]}."
+                    )
+                concat_list.append(source_tensor[..., start:end])
+            out_item[target_key] = torch.cat(concat_list, dim=-1)
             del concat_list
 
         for feature in self.feature_to_keep:
             if feature in item:
                 out_item[feature] = item[feature]
-
-        if not self.disabled_image_features:
-            for image_feature in self.images:
-                if image_feature in out_item:
-                    # Multi-source cameras have already been composed above;
-                    # resize the resulting logical view exactly once.
-                    out_item[image_feature] = resize_visual(out_item[image_feature], self.image_size)
 
         if len(self.actions_convert_from_state) > 0 and w_action:
             for action_feature in self.actions:
@@ -535,28 +548,39 @@ class FeatureTransform:
                 else:
                     item[action_feature] -= item[state_feature]
 
+        raw_states = None
+        if policy_eval:
+            # Preserve exact unnormalized, unclipped state tensors so unapply()
+            # reconstructs absolute poses from the same raw reference frame used
+            # during training and RTC prefix conversion.
+            raw_states = {
+                state_feature: (
+                    item[state_feature].detach().clone()
+                    if isinstance(item[state_feature], torch.Tensor)
+                    else torch.as_tensor(item[state_feature]).clone()
+                )
+                for state_feature in self.states
+                if state_feature in item
+            }
+
         if self.normalizer is not None:
             item = self.normalizer.normalize(item)
 
         if self.return_item_befor_padding:
+            if raw_states is not None:
+                item["raw_states"] = raw_states
             return item
 
         batch_dict = self.pad_and_concat(item, w_action)
 
         state = prepare_state(batch_dict, self.model_config.max_state_dim)
         actions = prepare_action(batch_dict, self.model_config.max_action_dim)
-        image_processor = getattr(self.processor, "image_processor", None)
+        visual_inputs = {}
         if not self.disabled_image_features:
-            images, img_masks, raw_images, image_grid_thw = prepare_images(
-                image_processor,
-                batch_dict,
-                image_keys=self.output_image_keys,
-                train=self.image_augment and not policy_eval,
-                return_raw_images=self.return_raw_images,
-                return_image_grid_thw=image_processor is not None,
+            visual_inputs = prepare_images(
+                item, self.model_images[-2:], self.head_model_image, self.model_config, self.processor,
+                augment=self.image_augment and not policy_eval, return_raw=self.return_raw_images,
             )
-        else:
-            images, img_masks, raw_images, image_grid_thw = [], [], None, None
 
         language = {}
         if not self.action_only:
@@ -594,8 +618,7 @@ class FeatureTransform:
 
         del batch_dict
         batch_dict = {
-            "images": images,
-            "img_masks": img_masks,
+            **visual_inputs,
             "state": state,
             "actions": actions,
             "action_is_pad": action_is_pad,
@@ -603,11 +626,9 @@ class FeatureTransform:
             "state_joint_mask": state_joint_mask,
             "action_joint_mask": action_joint_mask,
         }
+        if raw_states is not None:
+            batch_dict["raw_states"] = raw_states
         batch_dict.update(language)
-        if image_grid_thw is not None:
-            batch_dict["image_grid_thw"] = image_grid_thw
-        if self.return_raw_images:
-            batch_dict["raw_images"] = raw_images
         return batch_dict
 
     def _split_and_pad_action_feature(self, value, name):
@@ -727,26 +748,49 @@ class FeatureTransform:
             (0, self.model_config.max_action_dim - model_prefix.shape[-1]),
         )
 
+    def _feature_width(self, feature_key: str) -> int:
+        if self.normalizer is not None and feature_key in self.normalizer.norm_stats:
+            return int(self.normalizer.norm_stats[feature_key]["mean"].shape[-1])
+        if feature_key in self._mapped_feature_widths:
+            return self._mapped_feature_widths[feature_key]
+        base_name = feature_key.split("observation.state.")[-1].split("action.")[-1]
+        if self.feature_config.joints_max_dim and base_name in self.feature_config.joints_max_dim:
+            return int(self.feature_config.joints_max_dim[base_name])
+        raise KeyError(f"Unable to determine feature width for {feature_key!r}.")
+
     def unapply(self, item):
+        raw_states = item.get("raw_states")
         if not self.return_item_befor_padding:
             item = self.reverse_pad_and_concat(item)
 
         if self.normalizer is not None:
             item = self.normalizer.unnormalize(item)
 
+        if isinstance(raw_states, dict):
+            for state_feature, raw_value in raw_states.items():
+                if state_feature in self.states:
+                    item[state_feature] = raw_value
+
         for action_feature in self.actions:
             if self.action_subtract_state[action_feature]:
                 state_feature = action_feature.replace("action.", "observation.state.")
                 relative_type = self.action_relative_type.get(action_feature)
+                anchor_state = item[state_feature]
+                if isinstance(item[action_feature], torch.Tensor):
+                    anchor_state = torch.as_tensor(
+                        anchor_state,
+                        dtype=item[action_feature].dtype,
+                        device=item[action_feature].device,
+                    )
                 if _is_pose_relative_type(relative_type):
                     assert "end.position" in action_feature
                     item[action_feature] = absolute_pose(
                         item[action_feature],
-                        item[state_feature],
+                        anchor_state,
                         relative_type=relative_type,
                     )
                 else:
-                    item[action_feature] += item[state_feature]
+                    item[action_feature] = item[action_feature] + anchor_state
 
         item = self.reverse_features(item)
         return item
@@ -768,7 +812,7 @@ class FeatureTransform:
         for k, action, mask in zip(self.feature_config.joints, action_parts, action_masks, strict=True):
             state_key = f"observation.state.{k}"
             if state_key in self.states:
-                joint_dim = self.normalizer.norm_stats[state_key]["mean"].shape[-1]
+                joint_dim = self._feature_width(state_key)
                 reverse_item[state_key] = state[:joint_dim]
                 state = state[joint_dim:]
             del state_key
@@ -779,41 +823,6 @@ class FeatureTransform:
         return reverse_item
 
     def pad_and_concat(self, item, w_action=True):
-        images = {}
-
-        def _to_uint8(img):
-            # Keep images in uint8 [0, 255] before the Qwen-VL image processor, whose
-            # `do_rescale=True` divides by 255. lerobot decodes mp4 (video dtype) cameras
-            # already in uint8, but decodes parquet-embedded PNG (image dtype) cameras into
-            # float32 [0, 1]; feeding the latter as-is would be rescaled a second time and
-            # collapse the input to ~-1. Convert float [0, 1]-ish back to uint8, leave uint8 alone.
-            if not torch.is_tensor(img) or not img.is_floating_point():
-                return img
-            try:
-                max_val = float(img.max())
-            except RuntimeError:
-                max_val = 0.0
-            if max_val <= 2.0:
-                img = (img * 255).round().clamp(0, 255).to(torch.uint8)
-            return img
-
-        for image_key in self.model_images:
-            if image_key not in item:
-                continue
-            image = _to_uint8(item[image_key])
-            if image_key == self.head_model_image:
-                if image.ndim != 4 or image.shape[0] != 2:
-                    raise ValueError(
-                        f"Head camera {image_key!r} requires [history, current] with shape "
-                        f"[2,C,H,W], got {tuple(image.shape)}."
-                    )
-                images[image_key + ".history"] = image[0]
-                images[image_key] = image[1]
-            else:
-                if image.ndim != 3:
-                    raise ValueError(f"Wrist camera {image_key!r} requires [C,H,W], got {tuple(image.shape)}.")
-                images[image_key] = image
-
         states, state_joints_pad = [], []
 
         for k in self.feature_config.joints:
@@ -837,10 +846,7 @@ class FeatureTransform:
             if w_action:
                 value = item[action_key]
             else:
-                assert action_key in self.normalizer.norm_stats, (
-                    f"{action_key} not in norm keys: {self.normalizer.norm_stats.keys()}"
-                )
-                width = self.normalizer.norm_stats[action_key]["mean"].shape[-1]
+                width = self._feature_width(action_key)
                 value = torch.zeros(self.chunk_size, width)
             actions[action_key] = value
             action_masks[action_key] = value.new_ones((value.shape[-1],), dtype=torch.bool)
@@ -850,7 +856,6 @@ class FeatureTransform:
         chunk_joint_mask = action_joint_mask.clone().unsqueeze(0).repeat(self.chunk_size, 1)
 
         batch_dict = {
-            "image": images,
             "state": state,
             "action": action,
             "action_is_pad": item["action_is_pad"],

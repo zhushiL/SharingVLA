@@ -33,14 +33,50 @@ def load_observation(args, metadata):
 
     import yaml
     from xense0vla.data.robot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+    from xense0vla.data.transforms import history_offsets
 
     root = args.data_path.expanduser().resolve()
-    mapping = yaml.safe_load((ROOT / "configs/robot_configs/own_robot.yaml").read_text())
-    cameras = [next(iter(item.values()))["origin_keys"] for item in mapping["images"]]
+    robot_name = args.robot_name
+    if Path(robot_name).name != robot_name or robot_name in {"", ".", ".."}:
+        raise ValueError(f"Invalid --robot-name: {robot_name!r}")
+    config_root = (ROOT / "configs/robot_configs").resolve()
+    config_path = (config_root / f"{robot_name}.yaml").resolve()
+    if not config_path.is_relative_to(config_root) or not config_path.is_file():
+        raise FileNotFoundError(f"Robot config not found: {config_path}")
+    mapping = yaml.safe_load(config_path.read_text())
+    head_cameras: list[str] = []
+    wrist_cameras: list[str] = []
+    for item in mapping.get("images", []):
+        if isinstance(item, str):
+            target_key, origin = item, [item]
+        else:
+            target_key, spec = next(iter(item.items()))
+            raw_origin = spec.get("origin_keys", target_key)
+            origin = [raw_origin] if isinstance(raw_origin, str) else list(raw_origin)
+        if "top" in target_key or "head" in target_key:
+            head_cameras.extend(origin)
+        else:
+            wrist_cameras.extend(origin)
     full = metadata["policy_name"] == "vla"
     dataset_meta = LeRobotDatasetMetadata(root.name, root=root)
-    delta = {cameras[0]: [-metadata["head_history_offset"] / dataset_meta.fps, 0.0]} if full else None
-    selected = cameras if full else cameras[1:]
+    delta = None
+    if full and head_cameras:
+        offsets = history_offsets(metadata["history_memory"], metadata["history_stride"])
+        delta = dict.fromkeys(head_cameras, [offset / dataset_meta.fps for offset in offsets])
+    selected = list(dict.fromkeys([*(head_cameras if full else []), *wrist_cameras]))
+    state_keys: list[str] = []
+    for item in mapping.get("states", []):
+        if isinstance(item, str):
+            state_keys.append(item)
+        else:
+            for spec in item.values():
+                origin = spec.get("origin_keys")
+                if isinstance(origin, str):
+                    state_keys.append(origin)
+                elif isinstance(origin, list):
+                    for part in origin:
+                        state_keys.extend(part.keys())
+    state_keys = list(dict.fromkeys(state_keys)) or ["observation.state"]
     dataset = LeRobotDataset(
         root.name,
         root=root,
@@ -51,7 +87,7 @@ def load_observation(args, metadata):
         video_backend=args.video_backend,
     )
     raw = dataset[args.sample_index]
-    keys = [*selected, "observation.state", *(["task"] if full else [])]
+    keys = [*selected, *state_keys, *(["task"] if full else [])]
     return {key: raw[key].cpu().numpy() if hasattr(raw[key], "cpu") else raw[key] for key in keys}
 
 
@@ -148,8 +184,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8006)
+    parser.add_argument("--api-key", default=None, help="Optional API key matching the server's --api-key.")
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--data-path", type=Path, help="Local LeRobot dataset with the own_robot mapping.")
+    source.add_argument("--data-path", type=Path, help="Local LeRobot dataset matching --robot-name.")
     source.add_argument("--observation", type=Path, help="NPZ containing native observation keys; no pickled objects.")
     parser.add_argument("--sample-index", type=int, default=165)
     parser.add_argument("--video-backend", choices=("pyav", "torchcodec"), default="pyav")
@@ -172,7 +209,7 @@ def main():
             raise ConnectionError("The policy server health check failed.")
     finally:
         connection.close()
-    client = WebsocketClientPolicy(host=args.host, port=args.port)
+    client = WebsocketClientPolicy(host=args.host, port=args.port, api_key=args.api_key)
     try:
         observation = load_observation(args, client.get_server_metadata())
         report = benchmark(
