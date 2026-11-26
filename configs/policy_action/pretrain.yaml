@@ -71,9 +71,9 @@ train:
   micro_batch_size: 16
   gradient_accumulation_steps: 1
   init_device: cuda
-  data_parallel_mode: fsdp2
-  enable_full_shard: true
-  module_fsdp_enable: true
+  data_parallel_mode: ddp
+  # enable_full_shard: true
+  # module_fsdp_enable: true
   enable_gradient_checkpointing: true
   rmpad: false
   rmpad_with_pos_ids: false
