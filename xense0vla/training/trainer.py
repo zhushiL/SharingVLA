@@ -553,7 +553,7 @@ def train(recipe):
                     )
                 performance_message = "Perf min/mean/max: " + ", ".join(summaries)
             logger.info_rank0(
-                f"Step {global_step}/{args.train.train_steps}, "
+                f"Step {epoch_step + 1}/{args.train.train_steps}, "
                 f"Epoch {epoch+1}, "
                 f"Total_Loss {total_loss:.4f}, "
                 f"Action_Loss {total_action_loss:.4f}, "
