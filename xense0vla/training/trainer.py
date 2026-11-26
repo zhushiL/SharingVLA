@@ -522,7 +522,9 @@ def train(recipe):
             peak_reserved_gib = torch.cuda.max_memory_reserved() / 1024**3
             data_loader_tqdm.update()
             metrics_str = "".join(
-                f"{key} {value:.4f}, " for key, value in total_metrics.items()
+                f"{key} {value:.4f}, "
+                for key, value in total_metrics.items()
+                if key != "rtc/delay_mean"
             )
             performance_message = None
             if should_log_performance:

@@ -167,10 +167,9 @@ class FlowMatching(nn.Module):
             if self.config.loss_type == "fm"
             else F.l1_loss(velocity, target, reduction="none")
         )
-        metrics = {
-            "rtc/delay_mean": clean_prefix.sum(dim=1).float().mean().detach(),
-            "rtc/prefix_fraction": clean_prefix.float().mean().detach(),
-        }
+        metrics = {}
+        if self.config.rtc_training_enabled:
+            metrics["rtc/delay_mean"] = clean_prefix.sum(dim=1).float().mean().detach()
         return losses, language_loss, metrics, ~clean_prefix
 
     @torch.no_grad()
