@@ -352,9 +352,6 @@ def train(recipe):
             global_step += 1
             data_wait_time = time.perf_counter() - iteration_start_time
 
-            if global_step == 1:
-                helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
-
             should_log_performance = (
                 args.train.performance_log_steps > 0
                 and global_step % args.train.performance_log_steps == 0
