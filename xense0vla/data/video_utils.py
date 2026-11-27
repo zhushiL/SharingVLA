@@ -64,6 +64,15 @@ def _get_torchcodec_decoder(video_path: Path | str, device: str):
     return decoder
 
 
+def _effective_tolerance_s(query_ts: torch.Tensor, tolerance_s: float) -> torch.Tensor:
+    """Account for float32 parquet timestamp rounding on long episodes without hiding frame mismatches."""
+    query_f32 = query_ts.to(torch.float32)
+    ulp_f32 = torch.abs(
+        torch.nextafter(query_f32, torch.full_like(query_f32, float("inf"))) - query_f32
+    ).to(torch.float64)
+    return float(tolerance_s) + ulp_f32
+
+
 def _timestamps_to_frame_indices(
     timestamps: Sequence[float],
     average_fps: float,
@@ -148,8 +157,9 @@ def decode_video_frames_pyav(video_path, timestamps, tolerance_s):
         raise ValueError(f"No video frames decoded from {video_path} near timestamps {query_floats}.")
     query = torch.tensor(query_floats, dtype=torch.float64)
     loaded = torch.tensor(loaded_timestamps, dtype=torch.float64)
+    effective_tol = _effective_tolerance_s(query, tolerance_s)
     distances, indices = (query[:, None] - loaded[None, :]).abs().min(dim=1)
-    if not (distances < tolerance_s).all():
+    if not (distances < effective_tol).all():
         raise ValueError(
             f"Video timestamps exceed tolerance_s={tolerance_s} for {video_path}: "
             f"requested={query.tolist()}, nearest={loaded[indices].tolist()}."
@@ -221,7 +231,8 @@ def decode_video_frames_torchvision(
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
     min_, argmin_ = dist.min(1)
 
-    is_within_tol = min_ < tolerance_s
+    effective_tol = _effective_tolerance_s(query_ts, tolerance_s)
+    is_within_tol = min_ < effective_tol
     assert is_within_tol.all(), (
         f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
         "It means that the closest frame that can be loaded from the video is too far away in time."
@@ -298,7 +309,8 @@ def decode_video_frames_torchcodec(
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
     min_, argmin_ = dist.min(1)
 
-    is_within_tol = min_ < tolerance_s
+    effective_tol = _effective_tolerance_s(query_ts, tolerance_s)
+    is_within_tol = min_ < effective_tol
     assert is_within_tol.all(), (
         f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
         "It means that the closest frame that can be loaded from the video is too far away in time."
