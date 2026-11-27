@@ -1,13 +1,48 @@
 """Qwen head-camera and language features for the VLA's six coupled action blocks."""
 
+from types import MethodType
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from transformers import AutoConfig
 from transformers.models.qwen3_5 import Qwen3_5Config, Qwen3_5ForConditionalGeneration
-from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5VisionAttention,
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_vision,
+    get_vision_bilinear_indices_and_weights,
+    get_vision_position_ids,
+)
 
 from .qwen35_mot import apply_qwen35_mot_patch, qwen35_layer_type
+
+
+def _head_frame_attention(self, hidden_states, cu_seqlens, position_embeddings=None, *, frame_batch_size=0, **kwargs):
+    if not frame_batch_size:
+        return Qwen3_5VisionAttention.forward(self, hidden_states, cu_seqlens, position_embeddings, **kwargs)
+
+    # Keep HF's packed QKV projection and rotary positions; lift the uniform
+    # frame count to the SDPA batch axis so each frame attends to its own patches.
+    length = hidden_states.shape[0]
+    q, k, v = self.qkv(hidden_states).reshape(length, 3, self.num_heads, self.head_dim).unbind(1)
+    q, k = apply_rotary_pos_emb_vision(q, k, *position_embeddings)
+    q, k, v = (x.reshape(frame_batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2) for x in (q, k, v))
+    dropout_p = self.attention_dropout if self.training else 0.0
+    attended = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, scale=self.scaling)
+    return self.proj(attended.transpose(1, 2).reshape(length, -1))
+
+
+def _uniform_frame_grid(image_grid_thw: Tensor, total_patches: int) -> tuple[int, int, int] | None:
+    """Return ``(num_frames, height, width)`` when every frame shares the same ``(H, W)``."""
+    if image_grid_thw.ndim != 2 or image_grid_thw.shape[0] <= 0 or image_grid_thw.shape[1] != 3:
+        return None
+    rows = image_grid_thw.tolist()
+    _, height, width = rows[0]
+    if height <= 0 or width <= 0 or any(rt <= 0 or rh != height or rw != width for rt, rh, rw in rows):
+        return None
+    num_frames = sum(rt for rt, _, _ in rows)
+    return (num_frames, height, width) if num_frames * height * width == total_patches else None
 
 
 class QwenBackbone(nn.Module):
@@ -31,6 +66,9 @@ class QwenBackbone(nn.Module):
         self.vlm_config = vlm_config
         config.backbone_config = vlm_config.to_dict()
         self.qwen35 = Qwen3_5ForConditionalGeneration._from_config(vlm_config)
+        for block in self.qwen35.model.visual.blocks:
+            block.attn.forward = MethodType(_head_frame_attention, block.attn)
+        self._grid_meta_cache: dict[tuple[torch.device, int, int, int], dict[str, Tensor]] = {}
         text = vlm_config.text_config
         action = config.action_config
         if sum(kind == "full_attention" for kind in text.layer_types) != action["num_hidden_layers"] // 3:
@@ -55,6 +93,40 @@ class QwenBackbone(nn.Module):
     def language_model(self):
         return self.qwen35.model.language_model
 
+    def _uniform_grid_metadata(
+        self,
+        num_frames: int,
+        height: int,
+        width: int,
+        device: torch.device,
+    ) -> dict[str, Tensor]:
+        key = (device, num_frames, height, width)
+        cached = self._grid_meta_cache.get(key)
+        if cached is not None:
+            return cached
+        visual = self.qwen35.model.visual
+        with torch.no_grad():
+            unit_grid = torch.tensor([[1, height, width]], device=device, dtype=torch.long)
+            bi, bw = get_vision_bilinear_indices_and_weights(
+                unit_grid,
+                num_grid_per_side=visual.num_grid_per_side,
+                spatial_merge_size=visual.config.spatial_merge_size,
+            )
+            pids = get_vision_position_ids(unit_grid, visual.spatial_merge_size)
+            frame_patches = height * width
+            meta = {
+                "bilinear_indices": bi.repeat(1, num_frames),
+                "bilinear_weights": bw.repeat(1, num_frames),
+                "position_ids": pids.repeat(num_frames, 1),
+                "cu_seqlens": torch.arange(
+                    0, (num_frames + 1) * frame_patches, frame_patches, device=device, dtype=torch.int32
+                ),
+            }
+        if len(self._grid_meta_cache) >= 16:
+            self._grid_meta_cache.clear()
+        self._grid_meta_cache[key] = meta
+        return meta
+
     def embed_images(self, pixel_values: Tensor, image_grid_thw: Tensor) -> Tensor:
         if pixel_values.ndim != 4:
             raise ValueError(f"Qwen image input must be preprocessed [B,N,256,1536], got {pixel_values.shape}.")
@@ -62,7 +134,19 @@ class QwenBackbone(nn.Module):
         visual = self.qwen35.model.visual
         num_images = image_grid_thw.shape[0]
         visual_input_dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else visual.dtype
-        output = visual(pixel_values.to(dtype=visual_input_dtype), grid_thw=image_grid_thw, return_dict=True)
+        visual_kwargs = {}
+        uniform = _uniform_frame_grid(image_grid_thw, pixel_values.shape[0])
+        if uniform is not None:
+            num_frames, height, width = uniform
+            visual_kwargs.update(self._uniform_grid_metadata(num_frames, height, width, pixel_values.device))
+            if visual.config._attn_implementation == "sdpa":
+                visual_kwargs["frame_batch_size"] = num_frames
+        output = visual(
+            pixel_values.to(dtype=visual_input_dtype),
+            grid_thw=image_grid_thw,
+            return_dict=True,
+            **visual_kwargs,
+        )
         image_embeds = output.pooler_output
         if num_images <= 0 or image_embeds.shape[0] != num_images * 64:
             raise ValueError(
