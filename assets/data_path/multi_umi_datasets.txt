@@ -5,7 +5,7 @@
 # 其余任务比例为 1.00；实际参与帧数 = max(1, floor(原始帧数 × 比例))。
 # 固定无放回抽取样本起始帧；动作块仍从原始连续数据读取。
 # 逐任务比例同样用于归一化统计；data.sampling_seed 默认 42。
-# 统计来源：2026-11-05 逐份核验的 TacVerse 各任务 meta/info.json。
+
 
 own_robot sampling_ratio=1.00 TacVerse/taccap-g1-add-cucumber-slices-to-petri-dish
 own_robot sampling_ratio=1.00 TacVerse/taccap-g1-adjust-projector-stand

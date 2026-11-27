@@ -6,7 +6,7 @@ data:
   train_path: assets/data_path/multi_pretrain_datasets.txt
   robot_config_root: configs/robot_configs
   # 仅统计下列机器人；新增类型时同步更新。各映射必须输出相同的动作 / 状态空间。
-  robot_name: own_robot
+  robot_name: own_robot,robot1,robot2,robot3
 
   # ---- 输出与采样 ----
   norm_path: assets/norm_stats/multi_pretrain.json
