@@ -51,6 +51,7 @@ class QwenBackbone(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self._grid_meta_cache: dict[tuple[torch.device, int, int, int], dict[str, Tensor]] = {}
         apply_qwen35_mot_patch()
         if config.backbone_config is not None:
             vlm_config = Qwen3_5Config(**config.backbone_config)
@@ -68,7 +69,6 @@ class QwenBackbone(nn.Module):
         self.qwen35 = Qwen3_5ForConditionalGeneration._from_config(vlm_config)
         for block in self.qwen35.model.visual.blocks:
             block.attn.forward = MethodType(_head_frame_attention, block.attn)
-        self._grid_meta_cache: dict[tuple[torch.device, int, int, int], dict[str, Tensor]] = {}
         text = vlm_config.text_config
         action = config.action_config
         if sum(kind == "full_attention" for kind in text.layer_types) != action["num_hidden_layers"] // 3:
@@ -93,6 +93,10 @@ class QwenBackbone(nn.Module):
     def language_model(self):
         return self.qwen35.model.language_model
 
+    def _apply(self, fn, recurse=True):
+        self._grid_meta_cache.clear()
+        return super()._apply(fn, recurse=recurse)
+
     def _uniform_grid_metadata(
         self,
         num_frames: int,
@@ -105,7 +109,7 @@ class QwenBackbone(nn.Module):
         if cached is not None:
             return cached
         visual = self.qwen35.model.visual
-        with torch.no_grad():
+        with torch.inference_mode(False), torch.no_grad():
             unit_grid = torch.tensor([[1, height, width]], device=device, dtype=torch.long)
             bi, bw = get_vision_bilinear_indices_and_weights(
                 unit_grid,
